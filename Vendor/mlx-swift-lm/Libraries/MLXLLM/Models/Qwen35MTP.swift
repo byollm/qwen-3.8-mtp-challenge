@@ -16,6 +16,7 @@ import MLXNN
 /// Mirrors omlx `is_mtp_active()` / `set_mtp_active()` from
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
+public nonisolated(unsafe) var _qwen35DFlash2Attachment: AnyObject?
 
 /// E85 arm gate. `MLX_E85_FUSED_EMBED=0` restores the eager
 /// `embedTokens(ids)` before the dual-norm concat.

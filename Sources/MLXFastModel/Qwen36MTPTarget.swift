@@ -37,6 +37,8 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// True when the MTP head is attached and operational.
     var hasMTPHead: Bool { get }
 
+    var dFlash2Attachment: AnyObject? { get }
+
     /// The hybrid cache stack: `MambaCache` on the gated-delta layers,
     /// `KVCacheSimple` on the full-attention layers.
     func newCache(parameters: GenerateParameters?) -> [KVCache]
@@ -50,6 +52,14 @@ public protocol Qwen36MTPTarget: AnyObject {
     func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
+
+    func callWithDFlash2Taps(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (logits: MLXArray, hidden: MLXArray, taps: MLXArray)
+
+    func dFlash2Embed(_ tokenIDs: MLXArray) -> MLXArray
 
     /// `callWithHidden` plus the post-norm block the same forward already
     /// computed on its way to the vocabulary projection. A nil third element
