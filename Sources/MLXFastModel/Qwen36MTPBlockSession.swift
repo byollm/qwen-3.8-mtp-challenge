@@ -463,6 +463,50 @@ public final class Qwen36MTPBlockSession {
             }
         }
 
+        // PB5LIVE SELF-CALIBRATION. Opt-in (see `depthPriceArm`'s doc
+        // comment): only runs when `.pb5live` is actually selected, so every
+        // other arm's warmup -- including the shipped `.ship` default -- is
+        // byte-identical to before this block existed. Placement is
+        // load-bearing in the same way as the JIT-warm block above: this
+        // sits inside `warmAllDepthShapes`, strictly in the untimed warmup
+        // path, AFTER the width-ladder loop has already JIT-compiled both
+        // the width-5 and width-6 dispatch shapes on `warmCache` -- so the
+        // timed reps below measure steady-state dispatch cost only, never
+        // first-touch Metal-library compilation. `warmCache` is sitting at
+        // its clean 512-row committed-prefix state (the loop above restores
+        // that invariant after every iteration), which is exactly the
+        // precondition `measureLiveBoundaryTierFactor` documents.
+        if Self.depthPriceArm == .pb5live, maxDepth + 1 >= 6 {
+            if let measured = Self.measureLiveBoundaryTierFactor(
+                cache: warmCache, model: model)
+            {
+                Self.setLiveBoundaryTierFactor(measured)
+            }
+        }
+
+        // PBFITLIVE SELF-CALIBRATION. Same opt-in discipline and placement as
+        // the pb5live block above -- only runs when `.pbfitlive` is the
+        // selected arm, so every other arm's warmup (including the shipped
+        // `.ship` and the current `.pb5live` default) is byte-identical to
+        // before this block existed. Where pb5live times a single boundary,
+        // this times the WHOLE width curve (verify widths 3 ... maxDepth + 1 --
+        // the legal domain of the depth-price vector; width 2 is priced by a
+        // flat fallback, see `measureLiveDepthPriceCurve`). It is gated on the
+        // session having warmed the full depth range
+        // (`maxDepth >= Qwen36MTPLimits.maxDepth`, which given the `begin`
+        // guard means equality), so the width-ladder loop above (which warms
+        // 1 ... maxDepth + 1) has already JIT-compiled every verify width this
+        // measures.
+        if Self.depthPriceArm == .pbfitlive,
+           maxDepth >= Qwen36MTPLimits.maxDepth
+        {
+            if let curve = Self.measureLiveDepthPriceCurve(
+                cache: warmCache, model: model)
+            {
+                Self.setLiveDepthPriceCurve(curve)
+            }
+        }
+
         // A K>=2 round can reject its very first draft, which replays T=1.
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
@@ -912,14 +956,19 @@ public final class Qwen36MTPBlockSession {
 
     /// One priced boundary, holding the total. `width` is the verify width
     /// the priced step ENTERS, so it selects index `width - 2`.
+    ///
+    /// `tierFactor` defaults to the fixed, M4-Pro-fit `boundaryTierFactor` so
+    /// every existing call site (`pb5`, `pb7`) is byte-identical to before.
+    /// `pb5live` below passes a same-box LIVE measurement instead.
     internal static func makeBoundaryDepthPrice(
-        enteringVerifyWidth width: Int
+        enteringVerifyWidth width: Int,
+        tierFactor: Double = boundaryTierFactor
     ) -> DepthPrice {
         let count = Qwen36MTPLimits.maxDepth
         let within = Double(count) * headStepCostRatio
-            / (Double(count - 1) + boundaryTierFactor)
+            / (Double(count - 1) + tierFactor)
         var marginal = [Double](repeating: within, count: count)
-        marginal[width - 2] = within * boundaryTierFactor
+        marginal[width - 2] = within * tierFactor
         return DepthPrice(marginal: marginal,
                           cumulative: prefixCosts(marginal))
     }
@@ -976,7 +1025,7 @@ public final class Qwen36MTPBlockSession {
     }
 
     internal enum DepthPriceArm: String {
-        case ship, pb5, pb7, pbfit
+        case ship, pb5, pb7, pbfit, pb5live, pbfitlive
     }
 
     /// THE ONE LINE AN ARM SESSION PATCHES. `QwenMTPDepthPriceTests` pins the
@@ -988,18 +1037,390 @@ public final class Qwen36MTPBlockSession {
     /// shape is fitted to one dispatch table, so it is a research arm, not a
     /// shipped constant. Refit and re-price on the live table before shipping
     /// any non-uniform shape.
-    internal static let depthPriceArm: DepthPriceArm = .ship
+    ///
+    /// `pb5live` (2026-08-27) is the self-calibrating sibling of `pb5`: same
+    /// mechanism (`makeBoundaryDepthPrice(enteringVerifyWidth: 5, ...)`), but
+    /// the tier factor is measured on THIS box's own kernel dispatch table
+    /// during untimed warmup instead of read from `boundaryTierFactor`, the
+    /// fixed constant PR #958 fit on an Apple M4 Pro. M4 Pro has no per-core
+    /// Neural Accelerator matmul hardware -- Apple's M5 is the first
+    /// generation that does -- so a ratio baked in from M4 timings is not
+    /// expected to transfer to the M5 ranked runner; ranked evidence backs
+    /// this: `pb5` itself scored 3.6579 against a 3.7291 base, a real
+    /// -1.91 % regression (PR #1442). `pb5live` replaces the untrustworthy
+    /// constant with a live reading and falls back to `boundaryTierFactor`
+    /// only if that reading is missing or implausible (see
+    /// `measureLiveBoundaryTierFactor`). Selecting it requires flipping this
+    /// one line, exactly like every other arm; the shipped default stays
+    /// `ship` and is untouched by this arm's existence.
+    ///
+    /// `pbfitlive` (2026-08-27) is the untried COMBINATION of the two research
+    /// arms above. `pbfit` proved that pricing the full non-uniform width curve
+    /// wins big (-3.5 %) WHEN its shape matches the local kernel dispatch table,
+    /// and loses (+0.33 % on the crown table) when it does not -- because
+    /// `measuredRawDepthPrice` is a single offline fit. `pb5live` proved that a
+    /// LIVE on-device reading beats a stale cross-hardware constant -- but only
+    /// for the one width-5 -> width-6 boundary it measures. `pbfitlive` measures
+    /// the WHOLE width curve live on THIS box during warmup
+    /// (`measureLiveDepthPriceCurve`) and prices from it (`makeLiveDepthPrice`),
+    /// so it is full shape-awareness with no offline table to go stale: the
+    /// full-curve win without the mismatch risk. It falls back to the offline
+    /// `pbfit` curve (`makeMeasuredDepthPrice`) if the live reading is missing
+    /// or implausible. Like every arm it changes only the SHAPE of the price,
+    /// never the level, and selecting it is the same one-line flip.
+    internal static let depthPriceArm: DepthPriceArm = .pbfitlive
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
+    ///
+    /// LAZY-INIT ORDERING, load-bearing for `pb5live`: a Swift `static let`
+    /// initializer runs on first access, exactly once. The only reader is
+    /// `costModelDepth`, which is only ever reached from `generateRound`,
+    /// which the trusted worker never calls before `warmAllDepths` has
+    /// returned for the session in play (`QwenRuntimeMTPWorker` warms via
+    /// `mtp_decode_warm` or, failing that, lazily inside `mtp_decode_begin`
+    /// -- either way strictly before the first decode round). So by the time
+    /// this closure is forced, `liveBoundaryTierFactor` has already been set
+    /// (or definitively left `nil`) by that session's own warmup.
     internal static let depthPrice: DepthPrice = {
         switch depthPriceArm {
         case .ship: return makeUniformDepthPrice()
         case .pb5: return makeBoundaryDepthPrice(enteringVerifyWidth: 5)
         case .pb7: return makeBoundaryDepthPrice(enteringVerifyWidth: 7)
         case .pbfit: return makeMeasuredDepthPrice()
+        case .pb5live:
+            let factor = liveBoundaryTierFactor ?? boundaryTierFactor
+            return makeBoundaryDepthPrice(
+                enteringVerifyWidth: 5, tierFactor: factor)
+        case .pbfitlive:
+            // Full curve measured live on this box (see `depthPriceArm` doc).
+            // Fall back to the offline `pbfit` shape if warmup declined to
+            // publish a reading, mirroring pb5live's `?? boundaryTierFactor`.
+            if let curve = liveDepthPriceCurve {
+                return makeLiveDepthPrice(rawWidths: curve)
+            }
+            return makeMeasuredDepthPrice()
         }
     }()
+
+    // MARK: - pb5live: same-box live boundary-tier measurement
+
+    /// Storage for the live-measured tier factor. A plain `static var` would
+    /// race the warmup write against a decode-path read on different threads;
+    /// this repo's other cross-call mutable statics (`wiredTicketRetainer`)
+    /// use the same lock-guarded pattern.
+    private static let liveBoundaryTierFactorLock = NSLock()
+    nonisolated(unsafe) private static var liveBoundaryTierFactorStorage: Double?
+
+    /// The measured width-5 -> width-6 verify dispatch cost ratio, once
+    /// `measureLiveBoundaryTierFactor` has run during warmup, or `nil` before
+    /// that (or if the measurement declined to publish a reading). Read-only
+    /// outside this file; only `pb5live` consults it.
+    internal static var liveBoundaryTierFactor: Double? {
+        liveBoundaryTierFactorLock.lock()
+        defer { liveBoundaryTierFactorLock.unlock() }
+        return liveBoundaryTierFactorStorage
+    }
+
+    private static func setLiveBoundaryTierFactor(_ value: Double) {
+        liveBoundaryTierFactorLock.lock()
+        liveBoundaryTierFactorStorage = value
+        liveBoundaryTierFactorLock.unlock()
+    }
+
+    /// Timed repetitions per width in the live measurement. Kept small: this
+    /// runs inside untimed warmup, but warmup wall time is not free either
+    /// (it delays the hello the trusted parent is waiting on), and five reps
+    /// at an already-JIT-warm shape is enough to median away scheduler noise
+    /// without materially lengthening startup.
+    private static let liveBoundaryMeasureReps = 5
+
+    /// Times `repeats` back-to-back width-`width` verify dispatches on
+    /// `cache`. `cache` must already be warm (JIT-compiled) at this width --
+    /// i.e. called only after the width-ladder loop in `warmAllDepthShapes`
+    /// has run -- and must be sitting at the same clean 512-row committed-
+    /// prefix state that loop leaves it in between iterations.
+    ///
+    /// Each rep dispatches `model.callWithHiddenAndNormed` -- the exact call
+    /// a live verify round makes -- then replays the recurrent prefix and
+    /// trims the trimmable caches by exactly one row, mirroring the
+    /// `width >= 3` branch of the warm loop above byte-for-byte, so the cache
+    /// is restored to that same clean state before the next rep. Every timed
+    /// dispatch is therefore an identical shape against an identical KV
+    /// state, with no confounding growth or drift between reps -- this
+    /// reuses cache-management code already proven correct by that loop
+    /// rather than inventing a second one.
+    private static func timeVerifyWidth(
+        _ width: Int, cache: [any KVCache], model: any Qwen36MTPTarget,
+        repeats: Int
+    ) -> [Double] {
+        precondition(width >= 3, "pb5live timing only measures widths >= 3")
+        guard repeats > 0 else { return [] }
+        let block = Array(repeating: 0, count: width)
+        var samples: [Double] = []
+        samples.reserveCapacity(repeats)
+        for _ in 0 ..< repeats {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let (verifyLogits, _, verifyNormed) = model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
+                cache: cache, nConfirmed: 1)
+            var bundle: [MLXArray] = [verifyLogits]
+            if let verifyNormed { bundle.append(verifyNormed) }
+            // MLX perf guidance: evaluate once per timed rep, not twice. Two
+            // separate eval() calls add a second CPU<->GPU sync round trip
+            // whose fixed cost is not necessarily proportional between the
+            // width-5 and width-6 timings, so it biases the measured ratio.
+            // Merge the published outputs and the cache state into one eval so
+            // the timed window reflects dispatch cost only.
+            eval(bundle + cache.flatMap { $0.state })
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            samples.append(Double(t1 - t0))
+            precondition(model.replayRecurrentPrefix(
+                cache: cache, committedRows: width - 1))
+            for entry in cache where !(entry is ArraysCache) {
+                if entry.isTrimmable { _ = entry.trim(1) }
+            }
+            eval(cache.flatMap { $0.state })
+        }
+        return samples
+    }
+
+    private static func median(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[mid - 1] + sorted[mid]) / 2.0
+        }
+        return sorted[mid]
+    }
+
+    /// LIVE, SAME-BOX measurement of the width-5 -> width-6 verify dispatch
+    /// cost ratio -- the same physical boundary `boundaryTierFactor` prices
+    /// via `pb5`, but read from THIS machine's own kernel dispatch table
+    /// instead of the M4 Pro fit PR #958 recorded. Called only from
+    /// `warmAllDepthShapes`, strictly inside the untimed warmup, and only
+    /// when `depthPriceArm == .pb5live` is actually selected -- every other
+    /// arm's warmup is byte-identical to before this change.
+    ///
+    /// `cache` is expected already JIT-warm at widths 5 and 6 by the caller's
+    /// width-ladder loop, so these timed reps measure steady-state dispatch
+    /// cost, never first-touch Metal-library compilation. One untimed priming
+    /// rep runs at each width before the timed reps, to absorb any residual
+    /// allocator/graph-cache effects beyond that JIT the priming rep alone
+    /// would still pay.
+    ///
+    /// Returns `nil` (caller keeps the fixed `boundaryTierFactor`) on any
+    /// implausible reading: a non-finite or non-positive width-5 median, a
+    /// non-finite width-6 median, or a ratio outside a generous `[1.0, 6.0]`
+    /// plausibility band centered on the M4 Pro fit of 2.0301. A bad or noisy
+    /// reading must never be trusted into the schedule.
+    private static func measureLiveBoundaryTierFactor(
+        cache: [any KVCache], model: any Qwen36MTPTarget
+    ) -> Double? {
+        _ = timeVerifyWidth(5, cache: cache, model: model, repeats: 1)
+        let t5 = timeVerifyWidth(
+            5, cache: cache, model: model, repeats: liveBoundaryMeasureReps)
+        _ = timeVerifyWidth(6, cache: cache, model: model, repeats: 1)
+        let t6 = timeVerifyWidth(
+            6, cache: cache, model: model, repeats: liveBoundaryMeasureReps)
+        guard let m5 = median(t5), m5 > 0, m5.isFinite,
+              let m6 = median(t6), m6.isFinite
+        else { return nil }
+        let ratio = m6 / m5
+        // De-silence the live measurement: gated behind `traceRounds`, so zero
+        // overhead and zero behavior change on any timed/ranked run.
+        if Self.traceRounds {
+            Self.traceWrite(String(
+                format: "pb5live_measure w5_us=%.3f w6_us=%.3f ratio=%.5f\n",
+                m5 / 1_000.0, m6 / 1_000.0, ratio))
+        }
+        guard ratio.isFinite, ratio >= 1.0, ratio <= 6.0 else { return nil }
+        return ratio
+    }
+
+    // MARK: - pbfitlive: same-box live FULL depth-price curve measurement
+
+    /// Storage for the live-measured full depth-price curve (raw per-width
+    /// verify medians), set once by `measureLiveDepthPriceCurve` during warmup
+    /// or left `nil` if that measurement declined to publish. Same
+    /// lock-guarded cross-thread pattern as `liveBoundaryTierFactorStorage`:
+    /// the warmup write and the decode-path read land on different threads.
+    private static let liveDepthPriceCurveLock = NSLock()
+    nonisolated(unsafe) private static var liveDepthPriceCurveStorage: [Double]?
+
+    /// The measured raw per-width verify cost curve, once
+    /// `measureLiveDepthPriceCurve` has run during warmup, or `nil` before that
+    /// (or if the measurement declined). Read-only outside this file; only
+    /// `pbfitlive` consults it.
+    internal static var liveDepthPriceCurve: [Double]? {
+        liveDepthPriceCurveLock.lock()
+        defer { liveDepthPriceCurveLock.unlock() }
+        return liveDepthPriceCurveStorage
+    }
+
+    private static func setLiveDepthPriceCurve(_ value: [Double]) {
+        liveDepthPriceCurveLock.lock()
+        liveDepthPriceCurveStorage = value
+        liveDepthPriceCurveLock.unlock()
+    }
+
+    /// LIVE, SAME-BOX measurement of the FULL verify-width cost curve -- the
+    /// generalization of `measureLiveBoundaryTierFactor` from the single
+    /// width-5 -> width-6 boundary to every width the depth-price vector spans.
+    ///
+    /// DOMAIN, load-bearing. `DepthPrice.marginal` has exactly `maxDepth`
+    /// entries and `marginal[d]` prices the step into verify width `d + 2`, so
+    /// the vector spans verify widths `2 ... maxDepth + 1` -- NOT `maxDepth + 2`.
+    /// Width `maxDepth + 2` (10 at `maxDepth == 8`) is off the end of that
+    /// array's domain entirely, and is also past this stack's own hard row cap
+    /// (`rows_per_round = depth + 1 <= maxDepth + 1 = 9`, never 10), so a live
+    /// dispatch there is undefined, not merely unwarmed. This function
+    /// therefore live-measures widths `3 ... maxDepth + 1` (the legal, warmed
+    /// range that `timeVerifyWidth` accepts -- its precondition is width >= 3),
+    /// which fills marginal indices `1 ... maxDepth - 1` (7 widths at
+    /// `maxDepth == 8`).
+    ///
+    /// INDEX 0 (verify width 2) is not measurable: `timeVerifyWidth` refuses
+    /// widths below 3. It gets an explicit fallback -- `headStepCostRatio`, the
+    /// same flat per-step value `makeUniformDepthPrice` (`ship`) already uses
+    /// for every step -- prepended ahead of the live-measured widths.
+    ///
+    /// SCALE, load-bearing. `timeVerifyWidth` returns RAW NANOSECONDS (millions),
+    /// whereas `headStepCostRatio` is a dimensionless ~0.18. `makeLiveDepthPrice`
+    /// rescales with a single uniform scalar (`scale = total / raw.reduce(+)`),
+    /// so prepending the bare constant next to nanosecond medians would give
+    /// width 2 a ~zero share of the total (0.18 vs ~1.3e7) -- cheapening the very
+    /// entry that gates whether ANY drafting happens, a corrupt schedule, not a
+    /// flat one. So the live medians are first normalised to MEAN
+    /// `headStepCostRatio` (`headStepCostRatio / mean`), which preserves their
+    /// relative shape exactly (that single-scalar rescale is scale-invariant over
+    /// the whole array) while putting them on the same scale as the index-0
+    /// constant. `headStepCostRatio` then reads as a FLAT/AVERAGE step for the
+    /// one unmeasurable position -- the faithful `ship` interpretation for width
+    /// 2, and averaging all 7 live widths rather than privileging any single
+    /// one. The assembled raw array is thus
+    /// `[headStepCostRatio] + normalised(3...maxDepth+1)`, exactly `maxDepth`
+    /// long: the length `makeLiveDepthPrice`'s precondition expects. Since the
+    /// whole 8-element array then has mean ~= `headStepCostRatio`, that final
+    /// rescale's scalar is ~= 1, so `marginal[0]` lands at ~= `headStepCostRatio`
+    /// and `marginal[1...7]` carry the measured relative shape at the shipped
+    /// level -- none of this moves the level, only the per-position SHARES.
+    ///
+    /// Same discipline as the boundary measurement: called only from
+    /// `warmAllDepthShapes`, strictly inside untimed warmup, only when
+    /// `depthPriceArm == .pbfitlive` is actually selected, and only after the
+    /// width-ladder loop has JIT-compiled every one of these verify widths
+    /// (the ladder warms `1 ... maxDepth + 1`, so `3 ... maxDepth + 1` is fully
+    /// inside it) -- so the timed reps measure steady-state dispatch cost. One
+    /// untimed priming rep still runs at each width before the timed reps to
+    /// absorb any residual allocator/graph-cache effect.
+    ///
+    /// Returns `nil` (caller keeps the offline `pbfit` curve) under the same
+    /// implausibility rule the boundary function uses (any non-finite or
+    /// non-positive width median), PLUS a shape-level guard the single-
+    /// boundary function doesn't need: unlike `measureLiveBoundaryTierFactor`,
+    /// which bounds its one ratio to `[1.0, 6.0]`, a 7-point curve has no
+    /// single scalar to sanity-check, so `plausibleShape` below applies the
+    /// same generous `6.0`-per-step ceiling `boundaryTierFactor`'s own history
+    /// established as trustworthy, at every adjacent pair, plus a small
+    /// downward tolerance (measurement noise near a flat region can make a
+    /// wider verify read marginally cheaper than a narrower one even though
+    /// dispatch cost should not truly decrease with width) and an overall
+    /// max/min range cap so per-step noise cannot compound into a wildly
+    /// distorted curve across all 7 points. A noisy or bad reading must never
+    /// reach the schedule.
+    private static func plausibleShape(_ medians: [Double]) -> Bool {
+        guard medians.count >= 2 else { return true }
+        let minStepRatio = 1.0 / 1.5
+        let maxStepRatio = 6.0
+        for i in 1 ..< medians.count {
+            let stepRatio = medians[i] / medians[i - 1]
+            guard stepRatio.isFinite, stepRatio >= minStepRatio,
+                  stepRatio <= maxStepRatio
+            else { return false }
+        }
+        guard let lo = medians.min(), let hi = medians.max(), lo > 0 else {
+            return false
+        }
+        let totalRatio = hi / lo
+        return totalRatio.isFinite && totalRatio <= 10.0
+    }
+
+    private static func measureLiveDepthPriceCurve(
+        cache: [any KVCache], model: any Qwen36MTPTarget
+    ) -> [Double]? {
+        let lowWidth = 3
+        let highWidth = Qwen36MTPLimits.maxDepth + 1
+        var medians: [Double] = []
+        medians.reserveCapacity(highWidth - lowWidth + 1)
+        for width in lowWidth ... highWidth {
+            _ = timeVerifyWidth(width, cache: cache, model: model, repeats: 1)
+            let samples = timeVerifyWidth(
+                width, cache: cache, model: model,
+                repeats: liveBoundaryMeasureReps)
+            guard let m = median(samples), m > 0, m.isFinite else {
+                if Self.traceRounds {
+                    Self.traceWrite(
+                        "pbfitlive_measure width=\(width) median=declined\n")
+                }
+                return nil
+            }
+            if Self.traceRounds {
+                Self.traceWrite(String(
+                    format: "pbfitlive_measure width=%d median_us=%.3f\n",
+                    width, m / 1_000.0))
+            }
+            medians.append(m)
+        }
+        guard plausibleShape(medians) else {
+            if Self.traceRounds {
+                Self.traceWrite("pbfitlive_measure shape_guard=declined\n")
+            }
+            return nil
+        }
+        // Normalise the raw-nanosecond medians to mean `headStepCostRatio` so
+        // they share a scale with the index-0 constant (see doc, SCALE). Shape
+        // is preserved exactly; only the units change. Guard the mean so a
+        // degenerate (non-finite/non-positive) mean declines rather than
+        // producing NaN/inf shares.
+        let mean = medians.reduce(0.0, +) / Double(medians.count)
+        guard mean > 0, mean.isFinite else {
+            if Self.traceRounds {
+                Self.traceWrite("pbfitlive_measure mean=declined\n")
+            }
+            return nil
+        }
+        let norm = headStepCostRatio / mean
+        // Index 0 (verify width 2) is below `timeVerifyWidth`'s legal range and
+        // is priced as a flat/average step at the shared scale.
+        var raw: [Double] = [headStepCostRatio]
+        raw.append(contentsOf: medians.map { $0 * norm })
+        if Self.traceRounds {
+            Self.traceWrite("pbfitlive_measure raw=["
+                + raw.map { String(format: "%.5f", $0) }
+                    .joined(separator: ", ")
+                + "] (index 0 = headStepCostRatio fallback for width 2)\n")
+        }
+        return raw
+    }
+
+    /// Rescales a live-measured raw width curve exactly as
+    /// `makeMeasuredDepthPrice` rescales the offline `measuredRawDepthPrice`:
+    /// the SHAPE comes from the measurement, the total is pinned to
+    /// `maxDepth * headStepCostRatio`, so only the per-position distribution
+    /// moves and the level is unchanged. Only ever called with the array
+    /// `measureLiveDepthPriceCurve` returns, whose length is `maxDepth`.
+    internal static func makeLiveDepthPrice(rawWidths: [Double]) -> DepthPrice {
+        precondition(
+            rawWidths.count == Qwen36MTPLimits.maxDepth,
+            "pbfitlive: live depth-price curve is not maxDepth long")
+        let total = Double(Qwen36MTPLimits.maxDepth) * headStepCostRatio
+        let scale = total / rawWidths.reduce(0.0, +)
+        let marginal = rawWidths.map { $0 * scale }
+        return DepthPrice(marginal: marginal,
+                          cumulative: prefixCosts(marginal))
+    }
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
