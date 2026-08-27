@@ -690,6 +690,18 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  // Move this loader's threadgroup destination by `off` elements.
+  //
+  // The double-buffered dense `qmm_t` pipeline alternates between two staging
+  // tiles so that the device reads for K tile k+1 are issued before the
+  // arithmetic of K tile k. Only the DESTINATION moves: the source bytes, the
+  // group scale and bias, the dequantize call and the value written for every
+  // element are the ones this loader would have written anyway, so each K tile
+  // reaches the accumulator with the same values in the same order.
+  void advance_dst(int off) {
+    dst += off;
+  }
 };
 
 template <
@@ -830,6 +842,18 @@ struct QuantizedBlockLoader<
       biases += n_groups * group_stride;
     }
   }
+
+  // Move this loader's threadgroup destination by `off` elements.
+  //
+  // The double-buffered dense `qmm_t` pipeline alternates between two staging
+  // tiles so that the device reads for K tile k+1 are issued before the
+  // arithmetic of K tile k. Only the DESTINATION moves: the source bytes, the
+  // group scale and bias, the dequantize call and the value written for every
+  // element are the ones this loader would have written anyway, so each K tile
+  // reaches the accumulator with the same values in the same order.
+  void advance_dst(int off) {
+    dst += off;
+  }
 };
 
 template <typename T>
@@ -934,7 +958,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool pipelined = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -986,16 +1011,46 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Make the weight loader
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
 
-  constexpr short SM = BM / WM;
-  constexpr short SN = BN / WN;
+  // SIMDGROUP SPLIT: one row band per simdgroup, full output width.
+  //
+  // The stock split is the WM x WN grid the host's group dimensions imply, so
+  // simdgroups PAIR UP on `tm`: with WN = 2, simdgroups 0 and 1 share a row
+  // band and simdgroups 2 and 3 share the other. Each pair then loads the SAME
+  // activation rows from device, so half of every activation read this kernel
+  // issues duplicates one its neighbour is issuing at the same time.
+  // Activations are the larger of the two read streams here -- per K tile a
+  // threadgroup pulls 2 KiB of weights and 16 KiB of activations -- so the
+  // duplication is worth removing.
+  //
+  // Splitting purely along M gives every simdgroup its own row band and the
+  // full output width. That halves the activation reads (16 KiB -> 8 KiB per K
+  // tile) and pays for it in threadgroup reads of `Ws`, which is the cheap
+  // side. `WM * WN` is the simdgroup count either way, so the host's launch
+  // geometry is untouched.
+  //
+  // EXACTNESS. Only the assignment of output rows to simdgroups changes.
+  // Simdgroups are independent, every output element is still produced by
+  // exactly one of them, and `tile_matmad_nax` still walks `kk` innermost for a
+  // given fragment, so each element accumulates the same products in the same
+  // order. The stock 2x2 shape and this 1x4 shape take the same
+  // `TN % 2 == 0` branch of `tile_matmad_nax`.
+  //
+  // REGISTERS. `Dtile` is unchanged at TM * TN = 4 fragments; `Atile` halves
+  // (TM 2 -> 1) and `Btile` doubles (TN 2 -> 4), a small net increase.
+  constexpr short kSimdgroups = WM * WN;
+  constexpr short SM = BM / kSimdgroups;
+  constexpr short SN = BN;
   constexpr short SK = 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  const short tm = SM * (simd_gid / WN);
-  const short tn = SN * (simd_gid % WN);
+  static_assert(SM >= 16 && SM % 16 == 0, "row band must be a whole fragment");
+  static_assert(SN % 16 == 0, "output width must be a whole fragment");
+
+  const short tm = SM * simd_gid;
+  const short tn = 0;
 
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
@@ -1015,8 +1070,100 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   x += tm * K;
 
+  // Elements between the two staging tiles of the pipelined variant.
+  constexpr int tgp_tile_stride = BN * BK_padded;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      if constexpr (pipelined) {
+        // DOUBLE-BUFFERED K PIPELINE.
+        //
+        // The stock loop is store-then-consume behind two barriers, so every
+        // threadgroup stalls on the device reads of tile k before any of the
+        // arithmetic of tile k can start, and stalls again on the arithmetic
+        // before the reads of tile k+1 are issued. Here the loader writes tile
+        // k+1 into the OTHER staging tile while the accumulator consumes tile
+        // k, so the read latency of all but the first tile is hidden behind
+        // work that was going to run anyway.
+        //
+        // EXACTNESS. This moves WHEN the weights are fetched, never WHAT is
+        // fetched or in WHICH ORDER it is accumulated. `loader_w` performs the
+        // same sequence of loads (one prologue plus one per remaining tile,
+        // the same total as the stock loop) with the same `next()` cadence, so
+        // tile k holds the same dequantized values either way; the `kk1` loop
+        // issues the same `tile_matmad_nax` calls against the same `Atile` in
+        // the same k order. `Dtile` therefore accumulates an identical
+        // sequence of identical values and every output element is
+        // bit-identical to the stock loop's.
+        //
+        // ORDERING. One barrier per iteration is sufficient and necessary.
+        // Reaching it means every thread has finished consuming the tile it
+        // read last iteration, which is exactly the tile this iteration is
+        // about to overwrite, and that the tile this iteration consumes has
+        // been completely written by the previous iteration's prefetch.
+        if (K > 0) {
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
+          loader_w.next();
+          loader_w.advance_dst(tgp_tile_stride);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int dst_step = -tgp_tile_stride;
+        int cur = 0;
+
+        for (int k = 0; k < K; k += BK) {
+          threadgroup T* Wcur = Ws + cur * tgp_tile_stride;
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Wcur + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+
+          // The next tile is staged AFTER this tile's arithmetic, not before
+          // it. Both orders stage the same bytes and both need one barrier per
+          // iteration, but issuing the staging writes ahead of the arithmetic
+          // measured SLOWER on the target GPU than issuing them behind it, so
+          // this keeps the order that measured faster.
+          if (k + BK < K) {
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(short2(BK, tgp_bn));
+            }
+            loader_w.next();
+            loader_w.advance_dst(dst_step);
+            dst_step = -dst_step;
+          }
+
+          cur ^= 1;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      } else {
       for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
@@ -1054,6 +1201,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
         x += BK;
         loader_w.next();
+      }
       }
 
       // Store results to device memory
@@ -1227,7 +1375,18 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  // Two staging tiles: the dense qmm_t path runs the double-buffered K
+  // pipeline below, which writes tile k+1 while tile k is being consumed.
+  //
+  // GATED ON THE ELEMENT SIZE, and that gate is load-bearing. A second
+  // staging tile costs `BN * BK_padded * sizeof(T)` more threadgroup memory.
+  // At 2-byte elements that is 18,432 bytes total, comfortably inside the
+  // 32 KiB threadgroup allowance; at 4-byte elements it would be 34,816 and
+  // the pipeline creation for that instantiation would fail. Four-byte
+  // instantiations therefore keep the stock single tile and the stock loop,
+  // which is exactly what they did before this change.
+  constexpr bool qmm_t_nax_pipelined = sizeof(T) <= 2;
+  threadgroup T Ws[(qmm_t_nax_pipelined ? 2 : 1) * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1247,7 +1406,9 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+  qmm_t_nax_tgp_impl<
+      T, group_size, bits, aligned_N, BM, BK, BN, WM, WN,
+      qmm_t_nax_pipelined>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
