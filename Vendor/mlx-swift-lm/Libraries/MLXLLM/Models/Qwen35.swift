@@ -2086,11 +2086,11 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
                 normalized[element] = weight * rms_value;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // The stock RoPE primitive copies dimensions 64...255 unchanged before
-        // rotating nontraditional pairs (i, i + 32).  Here the final output is
-        // new storage, so only the pass-through tail needs an explicit copy.
+        // E142: the pass-through tail (dims 64...255) is written by the same
+        // thread that just stored `normalized[element]`. It does not read
+        // another lane, so it does not need the barrier. Early finishers
+        // copy while slower lanes are still in the apply loop. Rotate still
+        // reads pair+32 from another thread, so the barrier stays below.
         for (uint i = 0; i < n_reads; ++i) {
             uint element = first + i;
             if (element >= rotary_dimensions && element < axis_size) {
@@ -2101,6 +2101,7 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
                 }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (thread_id < rotary_pairs / n_reads) {
             for (uint i = 0; i < n_reads; ++i) {
