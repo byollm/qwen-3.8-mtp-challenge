@@ -322,27 +322,58 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
 
         InT activated[4];
         float sumsq = 0.0f;
+        // Four consecutive channels (`channel_base + lane * 4`) are 8-byte
+        // aligned on the live last-dim (`Dk = Dv = 128`). When that dim is
+        // packed (`stride == 1`), load the quartet as `vec<bfloat16_t,4>`
+        // per conv tap instead of four scalar bf16 loads. Weights stay
+        // scalar (channel-major layout is not a packed quartet at one tap).
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const uint channel0 = channel_base + lane * 4;
         #pragma clang loop unroll(full)
-        for (uint i = 0; i < 4; ++i) {
-          const uint channel = channel_base + lane * 4 + i;
-          float acc = 0.0f;
+        for (uint tap = 0; tap < 4; ++tap) {
+          const uint input_row = row + tap;
+          vec<bfloat16_t, 4> xv;
+          if (input_row < NKeep) {
+            const ulong input_offset =
+                ulong(input_row) * ulong(conv_state_strides[1])
+                + ulong(channel0) * ulong(conv_state_strides[2]);
+            if (conv_state_strides[2] == 1) {
+              xv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(
+                  conv_state + input_offset);
+            } else {
+              #pragma clang loop unroll(full)
+              for (uint i = 0; i < 4; ++i) {
+                xv[i] = conv_state[
+                    input_offset + ulong(i) * ulong(conv_state_strides[2])];
+              }
+            }
+          } else {
+            const ulong input_offset =
+                ulong(input_row - NKeep) * ulong(qkv_strides[1])
+                + ulong(channel0) * ulong(qkv_strides[2]);
+            if (qkv_strides[2] == 1) {
+              xv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(
+                  qkv + input_offset);
+            } else {
+              #pragma clang loop unroll(full)
+              for (uint i = 0; i < 4; ++i) {
+                xv[i] = qkv[
+                    input_offset + ulong(i) * ulong(qkv_strides[2])];
+              }
+            }
+          }
           #pragma clang loop unroll(full)
-          for (uint tap = 0; tap < 4; ++tap) {
-            const uint input_row = row + tap;
-            const ulong input_offset = input_row < NKeep
-                ? ulong(input_row) * ulong(conv_state_strides[1])
-                    + ulong(channel) * ulong(conv_state_strides[2])
-                : ulong(input_row - NKeep) * ulong(qkv_strides[1])
-                    + ulong(channel) * ulong(qkv_strides[2]);
-            const InT xv = input_row < NKeep
-                ? conv_state[input_offset]
-                : qkv[input_offset];
+          for (uint i = 0; i < 4; ++i) {
+            const uint channel = channel0 + i;
             const ulong weight_offset =
                 ulong(channel) * ulong(conv_weight_strides[0])
                 + ulong(tap) * ulong(conv_weight_strides[1]);
-            acc += static_cast<float>(xv) * conv_weight[weight_offset];
+            acc[i] += static_cast<float>(xv[i]) * conv_weight[weight_offset];
           }
-          const InT conv = static_cast<InT>(acc);
+        }
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+          const InT conv = static_cast<InT>(acc[i]);
           const InT act = conv * qwen35_prework_sigmoid(conv);
           activated[i] = act;
           const float value = static_cast<float>(act);
