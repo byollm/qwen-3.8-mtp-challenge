@@ -988,7 +988,23 @@ public final class Qwen36MTPBlockSession {
     /// shape is fitted to one dispatch table, so it is a research arm, not a
     /// shipped constant. Refit and re-price on the live table before shipping
     /// any non-uniform shape.
-    internal static let depthPriceArm: DepthPriceArm = .ship
+    ///
+    /// CANDIDATE (this worktree): `.pb5`. Unlike `pbfit`, this does not fit
+    /// anything to a measured table -- it takes the uniform price and
+    /// multiplies exactly one marginal entry (the step entering verify width
+    /// 6, i.e. `enteringVerifyWidth: 5`) by the already-named
+    /// `boundaryTierFactor` constant, rescaling the rest so the total holds
+    /// at `maxDepth * headStepCostRatio`. No host-specific fit to go stale.
+    /// The tree's own cost-model comment names this exact step as the
+    /// expensive one ("the step into verify width 6 costs 27.308 ms against
+    /// 13.405 ms for the step into width 5"), so `pb5` prices the boundary
+    /// the comment already identifies, rather than an unmeasured one.
+    /// A prior public attempt at this exact one-line change (PR #1323,
+    /// submission 847ae7e6) never produced a score -- the ranked benchmark
+    /// run itself failed at the timed-benchmark infra step, not a rejection
+    /// on measured performance. This arm is therefore genuinely untested,
+    /// not proven negative like `pbfit`.
+    internal static let depthPriceArm: DepthPriceArm = .pb5
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
