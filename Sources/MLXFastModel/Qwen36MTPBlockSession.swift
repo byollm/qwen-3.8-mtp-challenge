@@ -4,6 +4,21 @@ import MLXFastCore
 import MLXLLM
 import MLXLMCommon
 
+// ---------------------------------------------------------------------------
+// RESAMPLE PROVENANCE (comment-only delta).
+//
+// This tree is the promoted frontier content, unchanged in every executable
+// respect. The only delta against the parent is this comment block, added so
+// the archive is byte-distinct and can be measured again on the ranked box.
+//
+// It is submitted as a CONTROL, not as a mechanism: a same-content resample
+// prices the ranked runner's own draw-to-draw dispersion for this tree on the
+// day it runs, which is the reference every later candidate of ours is judged
+// against. No kernel, schedule, head declaration, dispatch, warm, cache
+// policy or numeric path is touched, so the emitted token stream and the row
+// ledger are identical to the parent's by construction.
+// ---------------------------------------------------------------------------
+
 // Qwen 3.6 27B native-MTP speculative decode — the worker-side hot path for the
 // `qwen3.8-27b-mtp-v1` track.
 //
