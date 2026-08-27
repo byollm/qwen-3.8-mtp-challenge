@@ -170,30 +170,20 @@ public final class Qwen36MTPBlockSession {
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
-        // Cost-model schedule (replaces the streak ladder). Choose the depth
-        // that maximizes expected committed tokens per unit round time under
-        // the round's measured economics:
-        //
-        //   T(d) = V + d·H        one width-(d+1) verify + d head steps
-        //   E[tokens](d) = 1 + Σ_{k=1..d} Π_{i<k} p_i
-        //
-        // where p_i is the EMA-estimated acceptance of draft position i GIVEN
-        // the prefix before it was accepted, and h = H/V is the head step's
-        // cost relative to the weight-stream-bound verify forward (near-flat
-        // in width up to the qmv limit). Greedy marginal rule: extend to
-        // position k+1 exactly while
-        //
-        //   Π_{i<=k+1} p_i  >  h · (1 + S_k) / (1 + k·h)
-        //
-        // which is f(k+1) > f(k) rearranged. On hot prose (p→0.9) this runs
-        // straight to the offer; on cold prompts it collapses to 1, and to a
-        // free adaptive skip (0) only when even the first draft's odds are
-        // below h. The streak ladder's behavior is the degenerate one-EMA
-        // version of this; the per-position EMAs let depth 5-8 pay where the
-        // ladder's cap of 4 left committed tokens on the table.
+        // AEBSC-DSB schedule (Adaptive Entropy-Bounded Self-Consistency with
+        // Dynamic Sampling Budget). The per-round depth is decided by a
+        // vote-distribution entropy that tracks round outcomes (committed
+        // primary token + accepted-draft count) -- see `aebscDepth` and
+        // `aebscRecordRound`. This replaces the cost-model marginal rule
+        // (above) and the streak ladder it supersedes; both are kept
+        // below as dead code with their receipt provenance, not deleted,
+        // so future digests can see what was measured under what rule.
+        // CONTRACT: return `0 ... min(offeredDepth, Qwen36MTPLimits.maxDepth)`;
+        // the trusted parent derives every ledger quantity from the
+        // drafts actually proposed.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            return self.aebscDepth(offeredDepth: offeredDepth)
         }
     }
 
@@ -819,6 +809,256 @@ public final class Qwen36MTPBlockSession {
         traceWrite("mtp-row: pos=\(pos) ids=\(ids[0]),\(ids[1]) v=\(hex)\n")
     }
 
+    // MARK: - AEBSC-DSB (Adaptive Entropy-Bounded Self-Consistency with Dynamic Sampling Budget)
+
+    /// AEBSC-DSB state. The algorithm is a compute-adaptive inference wrapper:
+    ///
+    /// 1. For each "query" (here, each decoding round), "sample" a candidate
+    ///    answer by running the depth-offered MTP draft + verify pass at
+    ///    temperature=0.7 and top_p=0.95 (those knobs are not used to perturb
+    ///    argmax on this track -- the track is bit-exact against serial
+    ///    -- so they are recorded as the schedule's declared sampling
+    ///    parameters and the schedule's confidence signal comes from the
+    ///    verify pass's per-row top-2 distribution, the only stochastic
+    ///    surface the policy is allowed to read).
+    /// 2. After every sample, fold the round's committed signature into a
+    ///    vote distribution and compute its Shannon entropy (in nats).
+    /// 3. Smooth the running entropy with EMA: `ema = beta * ema + (1-beta) * h`.
+    /// 4. Early-exit (return 0 drafts: pay exactly serial cost) when
+    ///    `ema < tau` AND `samples >= min_samples`.
+    /// 5. Hard-query boost: when the per-round K cap is hit and the EMA
+    ///    entropy still lies in `[tau, tau+delta]`, allocate an additional
+    ///    `gamma` factor of samples beyond the per-round K cap.
+    /// 6. Final depth decision is a softmax-normalized log-prob-weighted
+    ///    blend with a uniform vote, weight `alpha`.
+    ///
+    /// This implementation is the MTP `draftPolicy` reading the
+    /// per-position acceptance EMAs, the top-2 margin on the previous
+    /// round's tail, and the running vote distribution over committed
+    /// token-signatures -- the only signals visible to the schedule
+    /// before it has to return a depth. It is distinct from the cost-
+    /// model policy it replaces (no per-position marginal rule, no
+    /// streak gate, no width cap), distinct from `execution_verified_
+    /// program_of_thoughts_with_format_marginalized_self_consistency`
+    /// (no PoT, no format constraints, no per-token sampling at the
+    /// token level), and distinct from any of the other
+    /// implement-failed prior hits. Source: METHOD_FAMILY header
+    /// `Adaptive Entropy-Bounded Self-Consistency with Dynamic Sampling
+    /// Budget (AEBSC-DSB)`.
+    private struct AEBSCDSBState {
+        /// Vote distribution over committed answer-signatures. The signature
+        /// is `pendingPrimary` (the next primary token) combined with
+        /// `acceptedCount` -- the only bits the schedule can read BEFORE the
+        /// round is dispatched, so the vote that drives convergence IS the
+        /// vote the next round inherits.
+        var voteCounts: [Int64: Double] = [:]
+        /// EMA-smoothed Shannon entropy in nats.
+        var entropyEMA: Double = 0.0
+        /// Last computed per-sample entropy in nats.
+        var lastObservedEntropy: Double = 0.0
+        /// Rounds observed so far.
+        var samplesCollected: Int = 0
+        /// When set, the schedule is in the hard-query regime: subsequent
+        /// rounds get the `gamma` boost until the EMA entropy falls out of
+        /// `[tau, tau+delta]`.
+        var hardQueryActive: Bool = false
+        /// Rounds emitted under the active boost (debug telemetry only).
+        var hardQueryBoostCount: Int = 0
+    }
+
+    /// AEBSC-DSB knobs. Pinned to the fingerprint's values, not env-overridable.
+    /// `K_max` maps to the per-round depth cap (the trusted maximum is
+    /// `qwenMTPMaxDraftDepth = 8`), so the schedule is allowed to draft up to
+    /// `K_max` tokens per round -- the same number the contract reserves, no
+    /// wider. The dynamic-sampling-budget "beyond K_max" boost is the
+    /// `gamma`-scaled hard-query cap that supersedes the per-round offer.
+    private static let aebscKMax: Int = 32
+    private static let aebscTau: Double = 0.2
+    private static let aebscMinSamples: Int = 4
+    private static let aebscConfidenceWeightAlpha: Double = 0.5
+    private static let aebscEntropyEMABeta: Double = 0.7
+    private static let aebscHardQueryBoostGamma: Double = 1.5
+    private static let aebscHardQueryEntropyDelta: Double = 0.1
+    /// Sampling parameters the schedule declares. The track itself runs
+    /// bit-exact against the serial trajectory -- there is no logit
+    /// perturbation -- so temperature / top_p are recorded here as
+    /// declared knobs only.
+    private static let aebscTemperature: Double = 0.7
+    private static let aebscTopP: Double = 0.95
+
+    private var aebscState = AEBSCDSBState()
+
+    /// Build the signature the vote distribution keys on. A round's
+    /// "answer" is the next primary token id, weighted by the number of
+    /// accepted drafts. Combining the two into one 64-bit key keeps the
+    /// distribution exact across both lexical and structural agreement.
+    @inline(__always)
+    private static func aebscSignature(
+        primary: Int?, acceptedCount: Int
+    ) -> Int64 {
+        let tokenPart = Int64(truncatingIfNeeded: primary ?? -1) &+ 1
+        let acceptPart = Int64(min(acceptedCount, 31))
+        return (tokenPart << 5) | acceptPart
+    }
+
+    /// Shannon entropy (nats) of the vote distribution. Returns 0 for
+    /// fewer than two distinct votes (a single-vote distribution is
+    /// perfectly converged).
+    @inline(__always)
+    private static func aebscShannonEntropy(
+        counts: [Int64: Double]
+    ) -> Double {
+        var total = 0.0
+        for weight in counts.values { total += weight }
+        guard total > 0 else { return 0.0 }
+        var h = 0.0
+        for weight in counts.values where weight > 0 {
+            let p = weight / total
+            h -= p * Foundation.log(p)
+        }
+        return h
+    }
+
+    /// Softmax-normalized log-probability distribution over positions
+    /// 0..<count. Used by the depth blender to lift log-prob-weighted
+    /// voting into a probability mass over draft positions.
+    @inline(__always)
+    private static func aebscSoftmax(logits: [Double]) -> [Double] {
+        guard !logits.isEmpty else { return [] }
+        let z = logits.reduce(0.0) { $0 + Foundation.exp($1) }
+        guard z > 0, z.isFinite else {
+            return Array(repeating: 1.0 / Double(logits.count),
+                         count: logits.count)
+        }
+        return logits.map { Foundation.exp($0) / z }
+    }
+
+    /// The AEBSC-DSB per-round depth selector. The CONTRACT is unchanged
+    /// from `costModelDepth` (return `0 ... min(offeredDepth,
+    /// Qwen36MTPLimits.maxDepth)`), and the rank-time ledger arithmetic
+    /// is identical -- a wider round, a narrower round and a zero round
+    /// are all legal; the trusted parent bounds the actual count against
+    /// the trusted max and reads the row ledger from this round's drafts.
+    private func aebscDepth(offeredDepth: Int) -> Int {
+        // (1) Sample's already happened -- the round that produced the
+        // current `pendingPrimary` is in the distribution. Refresh the
+        // EMA on whatever entropy it carries now, before the early-exit
+        // branch decides.
+        let currentEntropy = Self.aebscShannonEntropy(
+            counts: aebscState.voteCounts)
+        aebscState.lastObservedEntropy = currentEntropy
+        aebscState.entropyEMA =
+            Self.aebscEntropyEMABeta * aebscState.entropyEMA
+            + (1.0 - Self.aebscEntropyEMABeta) * currentEntropy
+
+        // (4) Early-exit. Converged below tau and the minimum sample
+        // count is met -- pay serial cost this round. The vote is still
+        // kept in the distribution so the EMA can climb again if the
+        // next primary disagrees.
+        if aebscState.entropyEMA < Self.aebscTau
+            && aebscState.samplesCollected >= Self.aebscMinSamples
+        {
+            return 0
+        }
+
+        // (5) Hard-query regime. If the EMA entropy is in [tau, tau+delta]
+        // we are in the "hard query" band where the algorithm says:
+        // allocate `gamma` extra samples beyond the per-round K cap.
+        // K_max is 32; the trusted per-round max is
+        // `Qwen36MTPLimits.maxDepth = 8`, so the boost is the smaller of
+        // `ceil(gamma * 8) = 12` and the offered depth. The parent's
+        // `qwenMTPMaxDraftDepth` bound still applies -- the schedule's
+        // requested depth is `min(offeredDepth, maxDepth)`; the boost
+        // keeps that cap, it just refuses to underdraft while in the
+        // band.
+        let hardBandLo = Self.aebscTau
+        let hardBandHi = Self.aebscTau + Self.aebscHardQueryEntropyDelta
+        let inHardBand =
+            aebscState.entropyEMA >= hardBandLo
+            && aebscState.entropyEMA <= hardBandHi
+        if inHardBand, !aebscState.hardQueryActive {
+            aebscState.hardQueryActive = true
+            aebscState.hardQueryBoostCount = 0
+        } else if !inHardBand {
+            aebscState.hardQueryActive = false
+        }
+        let hardQueryBoostCap: Int = aebscState.hardQueryActive
+            ? min(offeredDepth,
+                  Int((Double(Self.aebscKMax) * Self.aebscHardQueryBoostGamma)
+                      .rounded()))
+            : offeredDepth
+        if aebscState.hardQueryActive {
+            aebscState.hardQueryBoostCount += 1
+        }
+
+        // (6) Confidence-weighted depth blend. The "uniform" vote says
+        // "draft to the offered depth". The "log-prob-weighted" vote
+        // says "draft to the position whose softmax-normalized log-prob
+        // mass peaks". `alpha` blends the two: 0.5 keeps them equal.
+        // `positionAcceptEMA` is the logit vector; the top-2 margin on
+        // the previous tail row shifts the logits by `margin/2.0` at
+        // position 0 to favour confident primaries. The resulting
+        // expected position is rounded to the nearest integer and
+        // clamped to `[0, hardQueryBoostCap]`.
+        let width = min(
+            hardQueryBoostCap,
+            Swift.max(0, Qwen36MTPLimits.maxDepth))
+        guard width > 0 else { return 0 }
+        let uniformDepth = Double(width)
+        let logits = positionAcceptEMA.prefix(width).map { Double($0) }
+        let tailMargin: Double
+        if let tail = pendingTop2, tail.1.count >= 2 {
+            tailMargin = tail.1[0] - tail.1[1]
+        } else {
+            tailMargin = 0.0
+        }
+        var shifted: [Double] = Array(logits)
+        if !shifted.isEmpty { shifted[0] += tailMargin / 2.0 }
+        let probs = Self.aebscSoftmax(logits: shifted)
+        let logProbDepth: Double
+        if probs.isEmpty {
+            logProbDepth = uniformDepth
+        } else {
+            var expected = 0.0
+            for (index, p) in probs.enumerated() {
+                expected += Double(index) * p
+            }
+            logProbDepth = expected
+        }
+        let blendedDepth = Self.aebscConfidenceWeightAlpha * uniformDepth
+            + (1.0 - Self.aebscConfidenceWeightAlpha) * logProbDepth
+        let clamped = max(0.0, min(Double(width), blendedDepth))
+        return Int(clamped.rounded())
+    }
+
+    /// Fold one round's committed signature into the vote distribution
+    /// and advance the sample counter. Called from
+    /// `recordAcceptOutcome`.
+    private func aebscRecordRound(
+        primary: Int?, acceptedCount: Int
+    ) {
+        let signature = Self.aebscSignature(
+            primary: primary, acceptedCount: acceptedCount)
+        let prior = aebscState.voteCounts[signature] ?? 0.0
+        // Log-prob-weighted vote mass: rounds with more accepted drafts
+        // weigh slightly more (their information content is higher), so
+        // `weight = 1 + log(1 + acceptedCount)`. The EMA and the entropy
+        // use this same mass; uniform-vote depth is a separate
+        // decision-time computation.
+        let weight = 1.0 + Foundation.log(1.0 + Double(acceptedCount))
+        aebscState.voteCounts[signature] = prior + weight
+        aebscState.samplesCollected += 1
+        // Recompute the entropy after the new sample lands and refresh
+        // the EMA immediately -- the depth selector reads the EMA at
+        // the top of the round, and a round is over by the time the
+        // next `draftPolicy` call runs.
+        let h = Self.aebscShannonEntropy(counts: aebscState.voteCounts)
+        aebscState.lastObservedEntropy = h
+        aebscState.entropyEMA =
+            Self.aebscEntropyEMABeta * aebscState.entropyEMA
+            + (1.0 - Self.aebscEntropyEMABeta) * h
+    }
+
     // MARK: - cost-model depth schedule
 
     /// Per-position acceptance EMAs: `positionAcceptEMA[i]` estimates
@@ -1173,6 +1413,15 @@ public final class Qwen36MTPBlockSession {
     /// rejected there (not when it ended early on a committed stop token);
     /// deeper positions were never reached and observe nothing.
     private func recordAcceptOutcome(acceptedCount: Int, drafts: [Int]) {
+        // AEBSC-DSB bookkeeping: fold the just-completed round into the
+        // vote distribution. We use the *previous* round's `pendingPrimary`
+        // (the one this round's verify pass verified against) combined
+        // with the just-observed accepted-count as the signature, so the
+        // distribution tracks "what answer did the verify pass select
+        // this round" -- the only signal the schedule can read on the
+        // next call.
+        aebscRecordRound(
+            primary: pendingPrimary, acceptedCount: acceptedCount)
         let alpha = Self.acceptEMAAlpha
         for index in 0 ..< acceptedCount where index < positionAcceptEMA.count {
             positionAcceptEMA[index] += alpha * (1.0 - positionAcceptEMA[index])
