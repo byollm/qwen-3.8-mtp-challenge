@@ -1883,6 +1883,721 @@ public enum Qwen35CustomQMV {
     }
 }
 
+private final class Qwen35MPPPackedRTN4 {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let outputSize: Int
+    let paddedOutputSize: Int
+
+    init(
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        outputSize: Int,
+        paddedOutputSize: Int
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.outputSize = outputSize
+        self.paddedOutputSize = paddedOutputSize
+    }
+}
+
+private enum Qwen35MPPRTN4M8 {
+    static let rows = 8
+    static let groupSize = 64
+    static let tileN = 128
+    static let storageN = 256
+    private static let threadsPerThreadgroup = 256
+
+    nonisolated(unsafe) private static var packed =
+        [ObjectIdentifier: Qwen35MPPPackedRTN4]()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_rtn4_mpp_m8_n128_storage256",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["out"],
+        source: body(externalInputSums: false),
+        header: #"""
+            #include <metal_stdlib>
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+            using namespace metal;
+            using namespace mpp::tensor_ops;
+            """#,
+        ensureRowContiguous: false
+    )
+
+    private static let summedKernel = MLXFast.metalKernel(
+        name: "qwen35_rtn4_mpp_m8_n128_storage256_sums",
+        inputNames: ["x", "w", "scales", "biases", "xsums"],
+        outputNames: ["out"],
+        source: body(externalInputSums: true),
+        header: #"""
+            #include <metal_stdlib>
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+            using namespace metal;
+            using namespace mpp::tensor_ops;
+            """#,
+        ensureRowContiguous: false
+    )
+
+    private static let mlpDownKernel = MLXFast.metalKernel(
+        name: "qwen35_rtn4_mpp_mlp_down_m8_n64_storage256_sums",
+        inputNames: ["x", "w", "scales", "biases", "xsums"],
+        outputNames: ["out"],
+        source: body(externalInputSums: true, tileN: 64),
+        header: #"""
+            #include <metal_stdlib>
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+            using namespace metal;
+            using namespace mpp::tensor_ops;
+            """#,
+        ensureRowContiguous: false
+    )
+
+    private static let gateUpKernel = MLXFast.metalKernel(
+        name: "qwen35_rtn4_mpp_gate_up_exact_m8_n256_sums",
+        inputNames: [
+            "x",
+            "gate_w", "gate_scales", "gate_biases",
+            "up_w", "up_scales", "up_biases",
+        ],
+        outputNames: ["out", "out_sums"],
+        source: gateUpBody(externalInputSums: false),
+        header: gateUpHeader,
+        ensureRowContiguous: false
+    )
+
+    private static let summedGateUpKernel = MLXFast.metalKernel(
+        name: "qwen35_rtn4_mpp_gate_up_exact_m8_n256_input_sums",
+        inputNames: [
+            "x",
+            "gate_w", "gate_scales", "gate_biases",
+            "up_w", "up_scales", "up_biases", "xsums",
+        ],
+        outputNames: ["out", "out_sums"],
+        source: gateUpBody(externalInputSums: true),
+        header: gateUpHeader,
+        ensureRowContiguous: false
+    )
+
+    private static let gateUpHeader = #"""
+            #include <metal_stdlib>
+            #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+            using namespace metal;
+            using namespace mpp::tensor_ops;
+            inline bfloat qwen35_mpp_sigmoid(bfloat x) {
+                auto y = 1 / (1 + metal::exp(metal::abs(x)));
+                return (x < 0) ? y : 1 - y;
+            }
+            """#
+
+    static func gateUp(
+        _ x: MLXArray,
+        gate: Linear,
+        up: Linear
+    ) -> MLXArray? {
+        guard x.ndim == 3,
+              x.shape[0] == 1,
+              (2 ... rows).contains(x.shape[1]),
+              x.dtype == .bfloat16,
+              let gate = gate as? QuantizedLinear,
+              let up = up as? QuantizedLinear,
+              let gateBiases = gate.biases,
+              let upBiases = up.biases,
+              gate.bias == nil,
+              up.bias == nil,
+              gate.groupSize == groupSize,
+              up.groupSize == groupSize,
+              gate.bits == 4,
+              up.bits == 4,
+              gate.mode == .affine,
+              up.mode == .affine,
+              gate.weight.dim(0) == up.weight.dim(0),
+              gate.weight.dim(1) == up.weight.dim(1),
+              gate.weight.dtype == .uint32,
+              up.weight.dtype == .uint32,
+              gate.scales.dtype == .bfloat16,
+              up.scales.dtype == .bfloat16,
+              gateBiases.dtype == .bfloat16,
+              upBiases.dtype == .bfloat16,
+              Qwen35CustomQMV.rowContiguous(x, rowStride: x.dim(-1)),
+              gate.weight.dim(1) == x.dim(-1) / 8
+        else { return nil }
+
+        let inputRows = x.shape[1]
+        let input = inputRows == rows
+            ? x
+            : concatenated(
+                [
+                    x,
+                    MLXArray.zeros(
+                        [1, rows - inputRows, x.dim(-1)],
+                        dtype: .bfloat16
+                    ),
+                ],
+                axis: 1
+            ).contiguous()
+
+        let packedGate = packedWeight(
+            weight: gate.weight,
+            scales: gate.scales,
+            biases: gateBiases
+        )
+        let packedUp = packedWeight(
+            weight: up.weight,
+            scales: up.scales,
+            biases: upBiases
+        )
+        guard packedGate.outputSize == packedUp.outputSize,
+              packedGate.outputSize == packedGate.paddedOutputSize,
+              packedUp.outputSize == packedUp.paddedOutputSize
+        else { return nil }
+
+        let persistentGroups = Swift.min(
+            36,
+            packedGate.outputSize / storageN
+        )
+        var inputs = [
+            input,
+            packedGate.weight,
+            packedGate.scales,
+            packedGate.biases,
+            packedUp.weight,
+            packedUp.scales,
+            packedUp.biases,
+        ]
+        let selectedKernel: MLXFast.MLXFastKernel
+        if let sums = Qwen35XSumsSidecar.takeMPP(
+            x, k: x.dim(-1), m: inputRows)
+        {
+            inputs.append(sums)
+            selectedKernel = summedGateUpKernel
+        } else {
+            selectedKernel = gateUpKernel
+        }
+        let outputs = selectedKernel(
+            inputs,
+            template: [
+                ("K", input.dim(-1)),
+                ("N", packedGate.outputSize),
+                ("PG", persistentGroups),
+            ],
+            grid: (
+                threadsPerThreadgroup * persistentGroups,
+                1,
+                1
+            ),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [
+                [1, rows, packedGate.outputSize],
+                [packedGate.outputSize / groupSize * rows],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        let fullOutput = outputs[0]
+        let output = inputRows == rows
+            ? fullOutput
+            : fullOutput[0..., ..<inputRows, 0...]
+        Qwen35XSumsSidecar.publish(x: output, table: outputs[1])
+        return output
+    }
+
+    static func call(
+        _ x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard x.ndim == 3,
+              x.shape[0] == 1,
+              (2 ... rows).contains(x.shape[1]),
+              x.dtype == .bfloat16,
+              bits == 4,
+              groupSize == Self.groupSize,
+              mode == .affine,
+              weight.dtype == .uint32,
+              scales.dtype == .bfloat16,
+              biases.dtype == .bfloat16,
+              Qwen35CustomQMV.rowContiguous(x, rowStride: x.dim(-1)),
+              Qwen35CustomQMV.rowContiguous(
+                  weight, rowStride: weight.dim(-1)),
+              Qwen35CustomQMV.rowContiguous(
+                  scales, rowStride: scales.dim(-1)),
+              Qwen35CustomQMV.rowContiguous(
+                  biases, rowStride: biases.dim(-1)),
+              weight.dim(1) == x.dim(-1) / 8,
+              scales.shape == biases.shape,
+              scales.dim(0) == weight.dim(0),
+              scales.dim(1) == x.dim(-1) / groupSize
+        else { return nil }
+
+        let inputRows = x.shape[1]
+        let input = inputRows == rows
+            ? x
+            : concatenated(
+                [
+                    x,
+                    MLXArray.zeros(
+                        [1, rows - inputRows, x.dim(-1)],
+                        dtype: .bfloat16
+                    ),
+                ],
+                axis: 1
+            ).contiguous()
+
+        let packed = packedWeight(
+            weight: weight,
+            scales: scales,
+            biases: biases
+        )
+        let persistentGroups = persistentGroups(
+            outputSize: packed.outputSize,
+            inputSize: x.dim(-1),
+            tiles: packed.paddedOutputSize / tileN
+        )
+        var inputs = [input, packed.weight, packed.scales, packed.biases]
+        let selectedKernel: MLXFast.MLXFastKernel
+        if let sums = Qwen35XSumsSidecar.takeMPP(
+            x, k: x.dim(-1), m: inputRows)
+        {
+            inputs.append(sums)
+            selectedKernel = summedKernel
+        } else {
+            selectedKernel = kernel
+        }
+        var output = selectedKernel(
+            inputs,
+            template: [
+                ("K", input.dim(-1)),
+                ("N", packed.paddedOutputSize),
+                ("PG", persistentGroups),
+            ],
+            grid: (
+                threadsPerThreadgroup * persistentGroups,
+                1,
+                1
+            ),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[1, rows, packed.paddedOutputSize]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        if packed.outputSize != packed.paddedOutputSize {
+            output = output[0..., 0..., ..<packed.outputSize]
+        }
+        return inputRows == rows
+            ? output
+            : output[0..., ..<inputRows, 0...]
+    }
+
+    static func mlpDown(_ x: MLXArray, down: QuantizedLinear) -> MLXArray {
+        let inputRows = x.shape[1]
+        let input = inputRows == rows
+            ? x
+            : concatenated(
+                [
+                    x,
+                    MLXArray.zeros(
+                        [1, rows - inputRows, x.dim(-1)],
+                        dtype: .bfloat16
+                    ),
+                ],
+                axis: 1
+            ).contiguous()
+        let packed = packedWeight(
+            weight: down.weight,
+            scales: down.scales,
+            biases: down.biases!
+        )
+        let output = mlpDownKernel(
+            [
+                input, packed.weight, packed.scales, packed.biases,
+                Qwen35XSumsSidecar.takeMPP(
+                    x, k: 17_408, m: inputRows)!,
+            ],
+            template: [
+                ("K", 17_408),
+                ("N", 5_120),
+                ("PG", 80),
+            ],
+            grid: (threadsPerThreadgroup * 80, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[1, rows, 5_120]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        return inputRows == rows
+            ? output
+            : output[0..., ..<inputRows, 0...]
+    }
+
+    private static func packedWeight(
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray
+    ) -> Qwen35MPPPackedRTN4 {
+        let key = ObjectIdentifier(weight)
+        if let value = packed[key] { return value }
+
+        let outputSize = weight.dim(0)
+        let paddedOutputSize =
+            (outputSize + storageN - 1) / storageN * storageN
+        let padding = paddedOutputSize - outputSize
+        let groups = scales.dim(1)
+        let rowWeight = padding == 0
+            ? weight
+            : concatenated(
+                [
+                    weight,
+                    MLXArray.zeros(
+                        [padding, weight.dim(1)], dtype: .uint32),
+                ],
+                axis: 0
+            )
+        let rowScales = padding == 0
+            ? scales
+            : concatenated(
+                [
+                    scales,
+                    MLXArray.zeros([padding, groups], dtype: .bfloat16),
+                ],
+                axis: 0
+            )
+        let rowBiases = padding == 0
+            ? biases
+            : concatenated(
+                [
+                    biases,
+                    MLXArray.zeros([padding, groups], dtype: .bfloat16),
+                ],
+                axis: 0
+            )
+        let value = Qwen35MPPPackedRTN4(
+            weight: rowWeight
+                .view(dtype: .uint8)
+                .reshaped(
+                    paddedOutputSize / storageN,
+                    storageN,
+                    groups,
+                    32
+                )
+                .swappedAxes(1, 2)
+                .contiguous()
+                .view(dtype: .uint32),
+            scales: rowScales
+                .reshaped(paddedOutputSize / storageN, storageN, groups)
+                .swappedAxes(1, 2)
+                .contiguous(),
+            biases: rowBiases
+                .reshaped(paddedOutputSize / storageN, storageN, groups)
+                .swappedAxes(1, 2)
+                .contiguous(),
+            outputSize: outputSize,
+            paddedOutputSize: paddedOutputSize
+        )
+        packed[key] = value
+        return value
+    }
+
+    private static func persistentGroups(
+        outputSize: Int,
+        inputSize: Int,
+        tiles: Int
+    ) -> Int {
+        if outputSize == 248_320 { return tiles }
+        if outputSize == 34_816 && inputSize == 5_120 {
+            return Swift.min(36, tiles)
+        }
+        if outputSize == 5_120 { return Swift.min(40, tiles) }
+        return Swift.min(60, tiles)
+    }
+
+    private static func body(externalInputSums: Bool, tileN: Int = 128) -> String {
+        let loadInputSums = externalInputSums
+            ? """
+                for (uint index = thread_position_in_threadgroup.x;
+                     index < 8 * G; index += 256) {
+                    input_sums[index] = xsums[index];
+                }
+                """
+            : """
+                if (simd_group < 8) {
+                    const uint row = simd_group;
+                    for (uint group = 0; group < G; ++group) {
+                        const ulong offset =
+                            ulong(row) * K + ulong(group) * 64 + lane;
+                        const float sum = simd_sum(
+                            float(xp[offset]) + float(xp[offset + 32]));
+                        if (lane == 0) {
+                            input_sums[group * 8 + row] = sum;
+                        }
+                    }
+                }
+                """
+        return #"""
+        constexpr uint TN = \#(tileN);
+        constexpr uint SN = 256;
+        constexpr uint G = K / 64;
+
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        device bfloat* xp = const_cast<device bfloat*>(x);
+        device uchar* wp = reinterpret_cast<device uchar*>(
+            const_cast<device uint*>(w));
+
+        auto a = tensor(
+            xp,
+            dextents<int, 2>{K, 8},
+            array<int, 2>{1, K});
+        auto c = tensor(
+            out,
+            dextents<int, 2>{N, 8},
+            array<int, 2>{1, N});
+        constexpr auto descriptor =
+            matmul2d_descriptor(8, TN, 64, false, true, false);
+        matmul2d<descriptor, execution_simdgroups<8>> operation;
+
+        threadgroup float input_sums[8 * G];
+        \#(loadInputSums)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint output_tile = threadgroup_position_in_grid.x;
+             output_tile < N / TN;
+             output_tile += PG) {
+            const uint output_origin = output_tile * TN;
+            const uint storage_tile = output_origin / SN;
+            const uint tile_offset = output_origin % SN;
+            device uchar* first_weight = wp
+                + (ulong(storage_tile) * G * SN + tile_offset) * 32;
+            tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
+                first_b(
+                    first_weight,
+                    dextents<int, 2>{64, TN},
+                    array<int, 2>{1, 64});
+            auto a0 = a.slice<64, 8>(0, 0);
+            auto b0 = first_b.slice<64, TN>(0, 0);
+            auto accumulated = operation.template
+                get_destination_cooperative_tensor<
+                    decltype(a0), decltype(b0), float>();
+
+            #pragma unroll
+            for (ushort index = 0;
+                 index < accumulated.get_capacity(); ++index) {
+                accumulated[index] = 0.0f;
+            }
+
+            for (uint group = 0; group < G; ++group) {
+                device uchar* group_weight = wp
+                    + ((ulong(storage_tile) * G + group) * SN
+                       + tile_offset) * 32;
+                tensor<device uint4b_format, dextents<int, 2>, tensor_inline> b(
+                    group_weight,
+                    dextents<int, 2>{64, TN},
+                    array<int, 2>{1, 64});
+                auto a_slice = a.slice<64, 8>(group * 64, 0);
+                auto b_slice = b.slice<64, TN>(0, 0);
+                auto partial = operation.template
+                    get_destination_cooperative_tensor<
+                        decltype(a_slice), decltype(b_slice), float>();
+                operation.run(a_slice, b_slice, partial);
+
+                #pragma unroll
+                for (ushort index = 0;
+                     index < accumulated.get_capacity(); ++index) {
+                    auto coordinate =
+                        accumulated.get_multidimensional_index(index);
+                    const uint column = coordinate[0];
+                    const uint row = coordinate[1];
+                    const ulong parameter =
+                        (ulong(storage_tile) * G + group) * SN
+                        + tile_offset + column;
+                    accumulated[index] +=
+                        partial[index] * float(scales[parameter])
+                        + input_sums[group * 8 + row]
+                            * float(biases[parameter]);
+                }
+            }
+
+            auto converted = operation.template
+                get_destination_cooperative_tensor<
+                    decltype(a0), decltype(b0), bfloat>();
+            #pragma unroll
+            for (ushort index = 0;
+                 index < accumulated.get_capacity(); ++index) {
+                converted[index] = bfloat(accumulated[index]);
+            }
+            converted.store(c.slice<TN, 8>(output_origin, 0));
+        }
+        """#
+    }
+
+    private static func gateUpBody(externalInputSums: Bool) -> String {
+        let loadInputSums = externalInputSums
+            ? """
+                for (uint index = thread_position_in_threadgroup.x;
+                     index < 8 * G; index += 256) {
+                    input_sums[index] = xsums[index];
+                }
+                """
+            : """
+                if (simd_group < 8) {
+                    const uint row = simd_group;
+                    for (uint group = 0; group < G; ++group) {
+                        const ulong offset =
+                            ulong(row) * K + ulong(group) * 64 + lane;
+                        const float sum = simd_sum(
+                            float(xp[offset]) + float(xp[offset + 32]));
+                        if (lane == 0) {
+                            input_sums[group * 8 + row] = sum;
+                        }
+                    }
+                }
+                """
+        return #"""
+        constexpr uint TN = 256;
+        constexpr uint G = K / 64;
+
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        device bfloat* xp = const_cast<device bfloat*>(x);
+        device uchar* gate_wp = reinterpret_cast<device uchar*>(
+            const_cast<device uint*>(gate_w));
+        device uchar* up_wp = reinterpret_cast<device uchar*>(
+            const_cast<device uint*>(up_w));
+
+        auto a = tensor(
+            xp,
+            dextents<int, 2>{K, 8},
+            array<int, 2>{1, K});
+        auto c = tensor(
+            out,
+            dextents<int, 2>{N, 8},
+            array<int, 2>{1, N});
+        constexpr auto descriptor =
+            matmul2d_descriptor(8, TN, 64, false, true, false);
+        matmul2d<descriptor, execution_simdgroups<8>> operation;
+
+        threadgroup float input_sums[8 * G];
+        \#(loadInputSums)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint tile = threadgroup_position_in_grid.x;
+             tile < N / TN;
+             tile += PG) {
+            const uint output_origin = tile * TN;
+            device uchar* first_gate_weight =
+                gate_wp + ulong(tile) * G * TN * 32;
+            device uchar* first_up_weight =
+                up_wp + ulong(tile) * G * TN * 32;
+            tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
+                first_gate(
+                    first_gate_weight,
+                    dextents<int, 2>{64, TN},
+                    array<int, 2>{1, 64});
+            tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
+                first_up(
+                    first_up_weight,
+                    dextents<int, 2>{64, TN},
+                    array<int, 2>{1, 64});
+            auto a0 = a.slice<64, 8>(0, 0);
+            auto gate_b0 = first_gate.slice<64, TN>(0, 0);
+            auto up_b0 = first_up.slice<64, TN>(0, 0);
+            auto gate_accumulated = operation.template
+                get_destination_cooperative_tensor<
+                    decltype(a0), decltype(gate_b0), float>();
+            auto up_accumulated = operation.template
+                get_destination_cooperative_tensor<
+                    decltype(a0), decltype(up_b0), float>();
+
+            #pragma unroll
+            for (ushort index = 0;
+                 index < gate_accumulated.get_capacity(); ++index) {
+                gate_accumulated[index] = 0.0f;
+                up_accumulated[index] = 0.0f;
+            }
+
+            for (uint group = 0; group < G; ++group) {
+                device uchar* gate_group_weight = gate_wp
+                    + (ulong(tile) * G + group) * TN * 32;
+                device uchar* up_group_weight = up_wp
+                    + (ulong(tile) * G + group) * TN * 32;
+                tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
+                    gate_b(
+                        gate_group_weight,
+                        dextents<int, 2>{64, TN},
+                        array<int, 2>{1, 64});
+                tensor<device uint4b_format, dextents<int, 2>, tensor_inline>
+                    up_b(
+                        up_group_weight,
+                        dextents<int, 2>{64, TN},
+                        array<int, 2>{1, 64});
+                auto a_slice = a.slice<64, 8>(group * 64, 0);
+                auto gate_b_slice = gate_b.slice<64, TN>(0, 0);
+                auto up_b_slice = up_b.slice<64, TN>(0, 0);
+                auto gate_partial = operation.template
+                    get_destination_cooperative_tensor<
+                        decltype(a_slice), decltype(gate_b_slice), float>();
+                auto up_partial = operation.template
+                    get_destination_cooperative_tensor<
+                        decltype(a_slice), decltype(up_b_slice), float>();
+                operation.run(a_slice, gate_b_slice, gate_partial);
+                operation.run(a_slice, up_b_slice, up_partial);
+
+                #pragma unroll
+                for (ushort index = 0;
+                     index < gate_accumulated.get_capacity(); ++index) {
+                    auto coordinate =
+                        gate_accumulated.get_multidimensional_index(index);
+                    const uint column = coordinate[0];
+                    const uint row = coordinate[1];
+                    const ulong parameter =
+                        (ulong(tile) * G + group) * TN + column;
+                    const float input_sum = input_sums[group * 8 + row];
+                    gate_accumulated[index] +=
+                        gate_partial[index] * float(gate_scales[parameter])
+                        + input_sum * float(gate_biases[parameter]);
+                    up_accumulated[index] +=
+                        up_partial[index] * float(up_scales[parameter])
+                        + input_sum * float(up_biases[parameter]);
+                }
+            }
+
+            auto converted = operation.template
+                get_destination_cooperative_tensor<
+                    decltype(a0), decltype(gate_b0), bfloat>();
+            #pragma unroll
+            for (ushort index = 0;
+                 index < gate_accumulated.get_capacity(); ++index) {
+                const bfloat gate = bfloat(gate_accumulated[index]);
+                const bfloat up = bfloat(up_accumulated[index]);
+                converted[index] =
+                    (gate * qwen35_mpp_sigmoid(gate)) * up;
+            }
+            converted.store(c.slice<TN, 8>(output_origin, 0));
+
+            threadgroup_barrier(mem_flags::mem_device);
+            const uint sum_row = simd_group;
+            #pragma unroll
+            for (uint local_group = 0; local_group < 4; ++local_group) {
+                const ulong offset = ulong(sum_row) * N + output_origin
+                    + local_group * 64 + lane;
+                const float sum = simd_sum(
+                    float(out[offset]) + float(out[offset + 32]));
+                if (lane == 0) {
+                    out_sums[
+                        (output_origin / 64 + local_group) * 8 + sum_row
+                    ] = sum;
+                }
+            }
+        }
+        """#
+    }
+}
+
 /// `quantizedMM` with the candidate-owned wide QMV dispatch in front of it.
 /// `Qwen35CustomQMV.matmul` returns nil for every arm, shape, width, group
 /// size, bit width and mode it does not own, so this is a drop-in replacement
@@ -2164,7 +2879,9 @@ func qwen35AttentionQKRMSRoPE(
 /// because the add is rounded to BF16 BEFORE squaring (matching the write-back
 /// and re-read of `h` in the eager path) and the accumulation / reduction tree
 /// mirrors `rms_norm.metal` exactly.
-private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
+private func qwen35FusedResidualRMSNormSource(
+    emitSums: Bool, emitMPPSums: Bool = false
+) -> String {
     // Lane stride of the chunk-sum table, mirroring
     // `Qwen35CustomQMV.sumsStride`. The launch is one threadgroup per
     // activation row, so `threadgroups_per_grid.x` is M.
@@ -2210,6 +2927,31 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                     const uint xs_lane = (xs_elem % 512) / 16;
                     xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
                 }
+        """ : ""
+    let mppSumsEpilogue =
+        emitMPPSums
+        ? """
+
+        threadgroup_barrier(mem_flags::mem_device);
+        const uint mpp_rows = threadgroups_per_grid.x;
+        const uint mpp_groups = axis_size / 64;
+        for (uint group = simd_group; group < mpp_groups;
+             group += simd_size) {
+            const ulong base = offset + ulong(group) * 64 + simd_thread;
+            const float sum = simd_sum(
+                float(normed[base]) + float(normed[base + 32]));
+            if (simd_thread == 0) {
+                xsums[group * 8 + row] = sum;
+            }
+        }
+        if (row == 0) {
+            for (uint index = thread_id; index < mpp_groups * 8;
+                 index += lsize) {
+                if (index % 8 >= mpp_rows) {
+                    xsums[index] = 0.0f;
+                }
+            }
+        }
         """ : ""
     return """
         constexpr uint n_reads = 4;
@@ -2302,6 +3044,7 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                 }
             }\(sumsEpilogue)
         }
+        \(mppSumsEpilogue)
     """
 }
 
@@ -2328,6 +3071,15 @@ private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     inputNames: ["x", "r", "weight", "eps"],
     outputNames: ["h", "normed", "xsums"],
     source: qwen35FusedResidualRMSNormSource(emitSums: true),
+    ensureRowContiguous: false
+)
+
+private let qwen35FusedResidualRMSNormMPPSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm_mpp_sums",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed", "xsums"],
+    source: qwen35FusedResidualRMSNormSource(
+        emitSums: false, emitMPPSums: true),
     ensureRowContiguous: false
 )
 
@@ -2370,19 +3122,16 @@ func qwen35FusedResidualRMSNorm(
 /// Chunk-sum tables emitted by a producing kernel's epilogue, keyed by the
 /// identity of the activation tensor they describe.
 ///
-/// `Qwen35CustomQMV.matmul` asks here before launching the standalone fill.
+/// Quantized consumers ask here before recomputing the same sums themselves.
 /// A hit is only ever returned for the exact `MLXArray` object the producer
 /// emitted: slots hold the activation weakly, so a released tensor can never
 /// alias a later one, and the slot's `(K, M)` is re-checked against the
 /// consumer's cell and the table's own size before it is handed out. A miss
-/// costs one allocation-free scan of eight slots and falls back to
-/// `xsumsTable`, so every path that does not pass through a publishing
-/// producer keeps today's dispatch exactly.
+/// costs one allocation-free scan of eight slots and keeps the consumer's
+/// existing fallback.
 ///
-/// Only the shipped `sumtable` arm publishes, and only at row counts the
-/// table pays at (`Qwen35CustomQMV.minimumTableWidth ... widths.upperBound`).
-/// `M = 1` -- the serial leg, which the candidate leg shares -- never reaches
-/// the variant kernel, so the serial path is byte-for-byte the shipped one.
+/// The fused norm publishes the wide-QMV layout and fused gate/up publishes
+/// the group-64 MPP layout; their distinct sizes select the matching consumer.
 enum Qwen35XSumsSidecar {
     struct Slot {
         weak var x: MLXArray?
@@ -2432,6 +3181,18 @@ enum Qwen35XSumsSidecar {
     /// activation has been released are dropped on the way past, so a table
     /// never outlives the tensor it describes by more than one scan.
     static func take(_ x: MLXArray, k: Int, m: Int) -> MLXArray? {
+        take(
+            x, k: k, m: m,
+            expectedSize: (k / 512) * 32 * Qwen35CustomQMV.sumsStride(m))
+    }
+
+    static func takeMPP(_ x: MLXArray, k: Int, m: Int) -> MLXArray? {
+        take(x, k: k, m: m, expectedSize: (k / 64) * 8)
+    }
+
+    private static func take(
+        _ x: MLXArray, k: Int, m: Int, expectedSize: Int
+    ) -> MLXArray? {
         lock.lock()
         defer { lock.unlock() }
         var hit: MLXArray?
@@ -2443,7 +3204,7 @@ enum Qwen35XSumsSidecar {
             guard hit == nil, held === x, slots[i].k == k, slots[i].m == m,
                 let table = slots[i].table,
                 table.dtype == .float32,
-                table.size == (k / 512) * 32 * Qwen35CustomQMV.sumsStride(m)
+                table.size == expectedSize
             else { continue }
             hit = table
         }
@@ -3639,7 +4400,22 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
+        forward(
+            inputs,
+            cache: cache,
+            nConfirmed: nConfirmed,
+            captureDFlash2Taps: false
+        ).hidden
+    }
+
+    func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0,
+        captureDFlash2Taps: Bool
+    ) -> (hidden: MLXArray, taps: MLXArray?) {
         var hiddenStates = embedTokens(inputs)
+        var dFlash2Taps: [MLXArray]? = captureDFlash2Taps ? [] : nil
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -3683,6 +4459,12 @@ public class Qwen35TextModelInner: Module {
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
                 base = out.base
                 delta = out.delta
+                if captureDFlash2Taps
+                    && (i == 5 || i == 19 || i == 33 || i == 47 || i == 61)
+                {
+                    let tap = out.base + out.delta
+                    dFlash2Taps?.append(tap)
+                }
                 if ladderActive {
                     if prefillLadder {
                         if i == 0 || i % 3 == 2 {
@@ -3703,6 +4485,11 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates = layer(
                     hiddenStates, attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if captureDFlash2Taps
+                    && (i == 5 || i == 19 || i == 33 || i == 47 || i == 61)
+                {
+                    dFlash2Taps?.append(hiddenStates)
+                }
                 if ladderActive {
                     if prefillLadder {
                         if i == 0 || i % 3 == 2 {
@@ -3716,7 +4503,10 @@ public class Qwen35TextModelInner: Module {
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
-        return hiddenStates
+        return (
+            hiddenStates,
+            dFlash2Taps.map { concatenated($0, axis: -1) }
+        )
     }
 
     /// Atomically rebuild every linear-attention layer at the same committed
@@ -5123,6 +5913,7 @@ public func qwen35VerifySelectedRerankOrderInvariance(
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
+    public let dFlash2Attachment: AnyObject?
 
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
@@ -5198,6 +5989,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
+        self.dFlash2Attachment = _qwen35DFlash2Attachment
         self.model = Qwen35TextModelInner(args)
 
         if !args.tieWordEmbeddings {
@@ -5206,7 +5998,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         // Attach MTP head only when enabled and config declares MTP layers.
         // omlx: `if n_mtp > 0 and is_mtp_active(): self.mtp = q35.MTPModule(args)`
-        if args.mtpNumHiddenLayers > 0 && _qwen35MTPEnabled {
+        if dFlash2Attachment == nil
+            && args.mtpNumHiddenLayers > 0 && _qwen35MTPEnabled
+        {
             _mtp.wrappedValue = Qwen35MTPModule(args)
         }
     }
@@ -5371,7 +6165,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
-    public var hasMTPHead: Bool { mtp != nil }
+    public var hasMTPHead: Bool { mtp != nil || dFlash2Attachment != nil }
 
     /// Run a backbone forward that also returns pre-norm hidden states.
     ///
@@ -5396,6 +6190,32 @@ extension Qwen35TextModel: MTPCapable {
         // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
         // is the normalization step — it expects the raw backbone output as input.
         return (logits, hidden)
+    }
+
+    public func callWithDFlash2Taps(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (logits: MLXArray, hidden: MLXArray, taps: MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let result = model.forward(
+            input.tokens,
+            cache: cacheOpt,
+            nConfirmed: nConfirmed,
+            captureDFlash2Taps: true
+        )
+        let normed = model.norm(result.hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = routedLMHead(lmHead, normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, result.hidden, result.taps!)
+    }
+
+    public func dFlash2Embed(_ tokenIDs: MLXArray) -> MLXArray {
+        model.embedTokens(tokenIDs)
     }
 
     /// Publish the post-norm block this same forward already needs for its
@@ -6003,11 +6823,30 @@ extension Qwen35Model: LoRAModel {
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
     public var hasMTPHead: Bool { languageModel.hasMTPHead }
+    public var dFlash2Attachment: AnyObject? {
+        languageModel.dFlash2Attachment
+    }
 
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func callWithDFlash2Taps(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> (logits: MLXArray, hidden: MLXArray, taps: MLXArray) {
+        languageModel.callWithDFlash2Taps(
+            input: input,
+            cache: cache,
+            nConfirmed: nConfirmed
+        )
+    }
+
+    public func dFlash2Embed(_ tokenIDs: MLXArray) -> MLXArray {
+        languageModel.dFlash2Embed(tokenIDs)
     }
 
     /// See `Qwen35TextModel.callWithHiddenAndNormed`.
