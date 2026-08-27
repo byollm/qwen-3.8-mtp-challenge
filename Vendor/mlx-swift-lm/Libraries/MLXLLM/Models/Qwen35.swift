@@ -1977,6 +1977,9 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+            if let fused = qwen35FusedSwiGLUXSums(y) {
+                return qwen35RoutedLinear(downProj, fused)
+            }
             return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
         }
         return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
@@ -2449,6 +2452,104 @@ enum Qwen35XSumsSidecar {
         }
         return hit
     }
+}
+
+// MARK: - mlp.down SwiGLU + xsums (fill geometry)
+
+/// Header-free SwiGLU that writes `silu(g)*u` and the chunk-sum table in the
+/// same launch geometry as `qwen35_custom_affine4_g64_xsums_v1`.
+///
+/// E134 used the residual 1024-thread RMS grid and FAILED n/a. This v3 kernel
+/// is one threadgroup of 32 per (row, k-block), the fill's own dispatch, with
+/// the packed-GDN bf16 sigmoid helper inlined (no `header:`). Serial M=1 never
+/// enters (tablePays m>=4).
+private let qwen35FusedSwiGLUXSumsSource = """
+        const int xs_m = y_shape[y_ndim - 2];
+        const int y_last = y_shape[y_ndim - 1];
+        const int xs_k = y_last / 2;
+        const int xs_stride = xs_m <= 8 ? 8 : 16;
+        const uint3 xs_gid = thread_position_in_grid;
+        const int xs_lane = int(xs_gid.x);
+        const int xs_kb = int(xs_gid.y);
+        const int xs_row = int(xs_gid.z);
+        if (xs_kb * 512 >= xs_k) {
+            return;
+        }
+        const ulong gate_off = ulong(xs_row) * ulong(y_last)
+            + ulong(xs_kb * 512 + xs_lane * 16);
+        const ulong act_off = ulong(xs_row) * ulong(xs_k)
+            + ulong(xs_kb * 512 + xs_lane * 16);
+        bfloat16_t acts[16];
+        for (int i = 0; i < 4; i++) {
+            const vec<bfloat16_t, 4> gv = *reinterpret_cast<
+                const device vec<bfloat16_t, 4>*>(y + gate_off + 4 * i);
+            const vec<bfloat16_t, 4> uv = *reinterpret_cast<
+                const device vec<bfloat16_t, 4>*>(
+                    y + gate_off + uint(xs_k) + 4 * i);
+            vec<bfloat16_t, 4> ov;
+            for (int j = 0; j < 4; j++) {
+                const bfloat16_t g = gv[j];
+                bfloat16_t sig;
+                const uint16_t bits = as_type<uint16_t>(g);
+                if (bits == uint16_t(0xC0DB)) {
+                    sig = as_type<bfloat16_t>(uint16_t(0x3A8B));
+                } else {
+                    auto sy = 1 / (1 + metal::exp(metal::abs(g)));
+                    sig = (g < 0) ? sy : 1 - sy;
+                }
+                ov[j] = (g * sig) * uv[j];
+                acts[4 * i + j] = ov[j];
+            }
+            *reinterpret_cast<device vec<bfloat16_t, 4>*>(
+                act + act_off + 4 * i) = ov;
+        }
+        float s = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            s += acts[4 * i] + acts[4 * i + 1]
+                + acts[4 * i + 2] + acts[4 * i + 3];
+        }
+        xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
+        """
+
+private let qwen35FusedSwiGLUXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_swiglu_xsums_v3",
+    inputNames: ["y"],
+    outputNames: ["act", "xsums"],
+    source: qwen35FusedSwiGLUXSumsSource,
+    ensureRowContiguous: false
+)
+
+/// Writes contiguous `[..., K]` SwiGLU and publishes the fill table for
+/// `down_proj`. Nil falls back to compiled SwiGLU + standalone `xsumsTable`.
+func qwen35FusedSwiGLUXSums(_ y: MLXArray) -> MLXArray? {
+    guard Qwen35CustomQMV.arm == .sumTable else { return nil }
+    guard y.dtype == .bfloat16, y.ndim >= 2 else { return nil }
+    let twoK = y.dim(-1)
+    guard twoK % 2 == 0 else { return nil }
+    let k = twoK / 2
+    guard k > 0, k % 512 == 0 else { return nil }
+    let rows = y.size / twoK
+    guard Qwen35CustomQMV.widths.contains(rows),
+        Qwen35CustomQMV.tablePays(m: rows),
+        y.dim(-2) == rows,
+        Qwen35CustomQMV.rowContiguous(y, rowStride: twoK)
+    else { return nil }
+    let kBlocks = k / 512
+    let tableLen = kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)
+    var actShape = y.shape
+    actShape[actShape.count - 1] = k
+    let grid = (32, kBlocks, rows)
+    let threadGroup = (32, 1, 1)
+    let outputs = qwen35FusedSwiGLUXSumsKernel(
+        [y],
+        grid: grid,
+        threadGroup: threadGroup,
+        outputShapes: [actShape, [tableLen]],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    let act = outputs[0]
+    Qwen35XSumsSidecar.publish(x: act, table: outputs[1])
+    return act
 }
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
