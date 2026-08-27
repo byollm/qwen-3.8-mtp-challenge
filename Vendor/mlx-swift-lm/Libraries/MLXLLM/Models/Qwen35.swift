@@ -2211,6 +2211,50 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                     xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
                 }
         """ : ""
+    // E143: only the xsums producer parks `hi`. Serial `emitSums == false`
+    // interpolates empty snippets so that Metal source stays the shipped
+    // two-pass body.
+    let parkDecl =
+        emitSums
+        ? """
+
+        bfloat loaded_h[8];
+        uint slot = 0;""" : ""
+    let parkStore =
+        emitSums
+        ? """
+
+                    loaded_h[slot++] = hi;""" : ""
+    let parkStoreTail =
+        emitSums
+        ? """
+
+                        loaded_h[slot++] = hi;""" : ""
+    let parkReset =
+        emitSums
+        ? """
+
+        slot = 0;""" : ""
+    let applyHi =
+        emitSums
+        ? """
+                    bfloat hi = loaded_h[slot++];
+"""
+        : """
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+"""
+    let applyHiTail =
+        emitSums
+        ? """
+                        bfloat hi = loaded_h[slot++];
+"""
+        : """
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+"""
     return """
         constexpr uint n_reads = 4;
         constexpr uint simd_size = 32;
@@ -2230,14 +2274,14 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
         ulong offset = ulong(row) * ulong(axis_size);
 
         // -- accumulate sum of squares of BF16-rounded (x+r) --
-        float acc = 0.0f;
+        float acc = 0.0f;\(parkDecl)
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
                 for (uint i = 0; i < n_reads; ++i) {
                     float xi = float(x[offset + elem + i]);
                     float ri = float(r[offset + elem + i]);
-                    bfloat hi = bfloat(xi + ri);
+                    bfloat hi = bfloat(xi + ri);\(parkStore)
                     acc += float(hi) * float(hi);
                 }
             } else {
@@ -2245,7 +2289,7 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                     if (elem + i < axis_size) {
                         float xi = float(x[offset + elem + i]);
                         float ri = float(r[offset + elem + i]);
-                        bfloat hi = bfloat(xi + ri);
+                        bfloat hi = bfloat(xi + ri);\(parkStoreTail)
                         acc += float(hi) * float(hi);
                     }
                 }
@@ -2275,27 +2319,21 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float inv_mean = local_inv_mean[0];
+        float inv_mean = local_inv_mean[0];\(parkReset)
 
         // -- write both the residual h and the weight-scaled normed output --
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
                 for (uint i = 0; i < n_reads; ++i) {
-                    float xi = float(x[offset + elem + i]);
-                    float ri = float(r[offset + elem + i]);
-                    bfloat hi = bfloat(xi + ri);
-                    h[offset + elem + i] = hi;
+\(applyHi)                    h[offset + elem + i] = hi;
                     bfloat wi = weight[elem + i];
                     normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
                 }
             } else {
                 for (uint i = 0; i < n_reads; ++i) {
                     if (elem + i < axis_size) {
-                        float xi = float(x[offset + elem + i]);
-                        float ri = float(r[offset + elem + i]);
-                        bfloat hi = bfloat(xi + ri);
-                        h[offset + elem + i] = hi;
+\(applyHiTail)                        h[offset + elem + i] = hi;
                         bfloat wi = weight[elem + i];
                         normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
                     }
@@ -2318,11 +2356,12 @@ private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
 /// standalone `qwen35_custom_affine4_g64_xsums_v1` dispatch that the routed
 /// consumer of `normed` would otherwise launch on its own.
 ///
-/// `h` and `normed` are produced by the shipped instruction stream, untouched.
-/// The epilogue is the fill kernel's own body over the same bytes, so the
-/// table it writes is the fill's table exactly. At K = 5120 and M <= 8 it is
-/// 10,240 bytes per activation, read back out of the cache lines the write
-/// loop has just touched.
+/// `h` and `normed` are the same BF16 words as the shipped two-pass body;
+/// the xsums variant parks `hi` across the RMS tree so the apply loop does
+/// not reload `x[]`/`r[]`. The epilogue is the fill kernel's own body over
+/// the same bytes, so the table it writes is the fill's table exactly. At
+/// K = 5120 and M <= 8 it is 10,240 bytes per activation, read back out of
+/// the cache lines the write loop has just touched.
 private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     name: "qwen35_fused_residual_rms_norm_xsums_v1",
     inputNames: ["x", "r", "weight", "eps"],
