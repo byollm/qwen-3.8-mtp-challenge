@@ -582,18 +582,19 @@ private let qwen35GatedDeltaReplayStateKernel: MLXFast.MLXFastKernel? = {
 
             for (int t = 0; t < T; ++t) {
               float kv_mem = 0.0f;
+              float k_parked[n_per_t];
               for (int i = 0; i < n_per_t; ++i) {
                 auto s_idx = n_per_t * dk_idx + i;
+                k_parked[i] = k_[s_idx];
                 state[i] = state[i] * g_[hv_idx];
-                kv_mem += state[i] * k_[s_idx];
+                kv_mem += state[i] * k_parked[i];
               }
               kv_mem = simd_sum(kv_mem);
 
               auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
 
               for (int i = 0; i < n_per_t; ++i) {
-                auto s_idx = n_per_t * dk_idx + i;
-                state[i] = state[i] + k_[s_idx] * delta;
+                state[i] = state[i] + k_parked[i] * delta;
               }
               // Increment data pointers to next time step
               k_ += Hk * Dk;
