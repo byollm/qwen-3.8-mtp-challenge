@@ -1038,7 +1038,49 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    ///
+    /// RAISED 7 -> 8: THE TRUSTED MAXIMUM, and the last width the offer can
+    /// reach. `MLXFastConstants.qwenMTPMaxDraftDepth` is 8 and the ranked
+    /// workflow offers 8 (`MLXFAST_QWEN_MTP_DEPTH: "8"`), so with the cap at 7
+    /// the eighth draft position was unreachable no matter what the marginal
+    /// rule wanted. Every structural consumer of a depth-8 round already
+    /// exists in this tree:
+    ///
+    ///   * verify width 9 = depth 8 + 1 is inside the ledger bound the worker
+    ///     checks (`verifyBlockTokens.count <= Qwen36MTPLimits.maxDepth + 1`)
+    ///     and inside `requireStructurallySound`'s
+    ///     `draftTokens.count <= qwenMTPMaxDraftDepth`.
+    ///   * `warmAllDepthShapes` already warms extra-counts `0 ... maxDepth`
+    ///     and verify widths `1 ... maxDepth + 1`, i.e. width 9, so a depth-8
+    ///     round hits no cold shape.
+    ///   * the sdpa exactness chunk in `attentionWithCacheUpdate` is written
+    ///     for `6 <= qL <= 9` and splits width 9 into 5 + 4 -- both halves on
+    ///     the fused vector path, with bottom-right-aligned windows identical
+    ///     to two consecutive <= 5-row rounds. Width 9 is covered by the same
+    ///     construction that made widths 6..8 bit-exact; it is not a new
+    ///     kernel family.
+    ///   * `Qwen35CustomQMV.widths` is `2 ... 9`, `activeInputGroups` has a
+    ///     width plan for 9, and both the standalone fill and the fused-norm
+    ///     xsums epilogue compute the M = 9 lane stride (16) from the row
+    ///     count rather than assuming 8.
+    ///
+    /// So the cap was policy, not structure -- the comment below says exactly
+    /// that ("Widths 6..8 are bit-exact per position against the serial
+    /// trajectory through the sdpa exactness chunk, so 7 is policy"). The
+    /// price of the extra step is measured and ordinary: E68 rung 1's raw
+    /// depth-price curve puts the step into verify width 9 at 0.4251 against
+    /// 0.4360 for the step into width 7, which this schedule already takes on
+    /// hot prose -- i.e. the eighth draft is *cheaper* at the margin than the
+    /// sixth. And the pool's own verdict on depth is recorded three comments
+    /// down: raising `headStepCostRatio` to shorten drafts cost -3%, "this
+    /// pool rewards depth".
+    ///
+    /// Safety is unchanged and does not rest on the cap. `reach` is the
+    /// product of the per-position acceptance EMAs, so a cold or struggling
+    /// stretch collapses the walk long before it reaches 8; the extra
+    /// position is only ever taken when seven consecutive positions have
+    /// already cleared their marginal thresholds.
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
