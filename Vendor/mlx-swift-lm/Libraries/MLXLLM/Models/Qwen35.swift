@@ -2165,53 +2165,17 @@ func qwen35AttentionQKRMSRoPE(
 /// and re-read of `h` in the eager path) and the accumulation / reduction tree
 /// mirrors `rms_norm.metal` exactly.
 private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
-    // Lane stride of the chunk-sum table, mirroring
-    // `Qwen35CustomQMV.sumsStride`. The launch is one threadgroup per
-    // activation row, so `threadgroups_per_grid.x` is M.
-    let sumsDecl =
-        emitSums
-        ? """
-
-            const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
-        """ : ""
-    // The chunk-sum epilogue: the BODY of
-    // `qwen35_custom_affine4_g64_xsums_v1` copied verbatim, run over the
-    // `normed` bytes this pass just wrote instead of over a separate
-    // dispatch's read of the same buffer. Same `vec<bfloat16_t, 4>` loads,
-    // same three BF16 adds per group of four, same ascending float
-    // accumulation onto `0.0f`, same
-    // `(k_block * 32 + lane) * stride + row` address. The table is therefore
-    // the standalone fill's bit pattern by construction -- identical source
-    // text over identical bytes -- not by an algebraic re-association
-    // argument.
-    //
-    // One pass of the write loop stores `lsize * n_reads` values, so the
-    // first `lsize / 4` threads cover them as 16-element groups. The device
-    // barrier publishes the neighbours' stores (the four writers of a group
-    // are always the same simdgroup, but the barrier is threadgroup-wide and
-    // sits in uniform control flow). `xs_elem` is a multiple of 16 and K is a
-    // multiple of 512, so a group lies wholly inside the row or wholly
-    // outside it and the guard never splits one.
-    let sumsEpilogue =
-        emitSums
-        ? """
-
-                threadgroup_barrier(mem_flags::mem_device);
-                const uint xs_elem = r_start + thread_id * 16;
-                if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
-                    const device bfloat16_t* xm = normed + offset + xs_elem;
-                    float s = 0.0f;
-                    for (int i = 0; i < 4; i++) {
-                        const vec<bfloat16_t, 4> xv = *reinterpret_cast<
-                            const device vec<bfloat16_t, 4>*>(xm + 4 * i);
-                        s += xv[0] + xv[1] + xv[2] + xv[3];
-                    }
-                    const uint xs_kb = xs_elem / 512;
-                    const uint xs_lane = (xs_elem % 512) / 16;
-                    xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
-                }
-        """ : ""
-    return """
+    // Serial `emitSums == false` is the shipped two-pass body, character for
+    // character, so the M=1 denominator does not move. The xsums producer
+    // (tablePays >= 4) is the only variant that changes: aligned chunks of
+    // four contiguous last-dim elements load `x`/`r` (and apply-loop
+    // `weight`) as `vec<bfloat16_t,4>`, the same load the fill epilogue
+    // already uses on `normed`. Scalar tails, the RMS tree, and the fill
+    // body stay stock. Two full source strings — no inner interpolation —
+    // because E143's snippet `"""` closers failed Swift's multiline indent
+    // rule at worker compile.
+    if !emitSums {
+        return """
         constexpr uint n_reads = 4;
         constexpr uint simd_size = 32;
         constexpr uint lsize = 1024;
@@ -2221,7 +2185,7 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
         uint simd_thread = thread_index_in_simdgroup;
         uint simd_group = simdgroup_index_in_threadgroup;
 
-        uint axis_size = uint(x_shape[x_ndim - 1]);\(sumsDecl)
+        uint axis_size = uint(x_shape[x_ndim - 1]);
 
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
@@ -2300,9 +2264,127 @@ private func qwen35FusedResidualRMSNormSource(emitSums: Bool) -> String {
                         normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
                     }
                 }
-            }\(sumsEpilogue)
+            }
         }
-    """
+        """
+    }
+    return """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        const uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                    const device vec<bfloat16_t, 4>*>(&x[offset + elem]);
+                const vec<bfloat16_t, 4> rv = *reinterpret_cast<
+                    const device vec<bfloat16_t, 4>*>(&r[offset + elem]);
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(xv[i]);
+                    float ri = float(rv[i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                    const device vec<bfloat16_t, 4>*>(&x[offset + elem]);
+                const vec<bfloat16_t, 4> rv = *reinterpret_cast<
+                    const device vec<bfloat16_t, 4>*>(&r[offset + elem]);
+                const vec<bfloat16_t, 4> wv = *reinterpret_cast<
+                    const device vec<bfloat16_t, 4>*>(&weight[elem]);
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(xv[i]);
+                    float ri = float(rv[i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = wv[i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+                threadgroup_barrier(mem_flags::mem_device);
+                const uint xs_elem = r_start + thread_id * 16;
+                if (thread_id < lsize / 4 && xs_elem + 16 <= axis_size) {
+                    const device bfloat16_t* xm = normed + offset + xs_elem;
+                    float s = 0.0f;
+                    for (int i = 0; i < 4; i++) {
+                        const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                            const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                        s += xv[0] + xv[1] + xv[2] + xv[3];
+                    }
+                    const uint xs_kb = xs_elem / 512;
+                    const uint xs_lane = (xs_elem % 512) / 16;
+                    xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+                }
+        }
+        """
 }
 
 private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
@@ -2318,11 +2400,12 @@ private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
 /// standalone `qwen35_custom_affine4_g64_xsums_v1` dispatch that the routed
 /// consumer of `normed` would otherwise launch on its own.
 ///
-/// `h` and `normed` are produced by the shipped instruction stream, untouched.
-/// The epilogue is the fill kernel's own body over the same bytes, so the
-/// table it writes is the fill's table exactly. At K = 5120 and M <= 8 it is
-/// 10,240 bytes per activation, read back out of the cache lines the write
-/// loop has just touched.
+/// `h` and `normed` use the same BF16 add/RMS/weight arithmetic as the
+/// shipped two-pass body. Aligned K=5120 chunks load `x`/`r`/`weight` as
+/// `vec<bfloat16_t,4>` (the fill epilogue's load). Scalar tails, the RMS
+/// tree, and the fill body stay stock. Serial `emitSums: false` is the
+/// shipped instruction stream. At K = 5120 and M <= 8 the table is 10,240
+/// bytes per activation.
 private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
     name: "qwen35_fused_residual_rms_norm_xsums_v1",
     inputNames: ["x", "r", "weight", "eps"],
