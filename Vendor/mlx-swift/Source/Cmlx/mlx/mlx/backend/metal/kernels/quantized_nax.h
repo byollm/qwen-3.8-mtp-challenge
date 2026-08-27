@@ -690,6 +690,18 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  // Move this loader's threadgroup destination by `off` elements.
+  //
+  // The double-buffered dense `qmm_t` pipeline alternates between two staging
+  // tiles so that the device reads for K tile k+1 are issued before the
+  // arithmetic of K tile k. Only the DESTINATION moves: the source bytes, the
+  // group scale and bias, the dequantize call and the value written for every
+  // element are the ones this loader would have written anyway, so each K tile
+  // reaches the accumulator with the same values in the same order.
+  void advance_dst(int off) {
+    dst += off;
+  }
 };
 
 template <
@@ -830,6 +842,18 @@ struct QuantizedBlockLoader<
       biases += n_groups * group_stride;
     }
   }
+
+  // Move this loader's threadgroup destination by `off` elements.
+  //
+  // The double-buffered dense `qmm_t` pipeline alternates between two staging
+  // tiles so that the device reads for K tile k+1 are issued before the
+  // arithmetic of K tile k. Only the DESTINATION moves: the source bytes, the
+  // group scale and bias, the dequantize call and the value written for every
+  // element are the ones this loader would have written anyway, so each K tile
+  // reaches the accumulator with the same values in the same order.
+  void advance_dst(int off) {
+    dst += off;
+  }
 };
 
 template <typename T>
@@ -934,7 +958,8 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    const bool pipelined = false>
 METAL_FUNC void qmm_t_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1015,8 +1040,92 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   x += tm * K;
 
+  // Elements between the two staging tiles of the pipelined variant.
+  constexpr int tgp_tile_stride = BN * BK_padded;
+
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      if constexpr (pipelined) {
+        // DOUBLE-BUFFERED K PIPELINE.
+        //
+        // The stock loop is store-then-consume behind two barriers, so every
+        // threadgroup stalls on the device reads of tile k before any of the
+        // arithmetic of tile k can start, and stalls again on the arithmetic
+        // before the reads of tile k+1 are issued. Here the loader writes tile
+        // k+1 into the OTHER staging tile while the accumulator consumes tile
+        // k, so the read latency of all but the first tile is hidden behind
+        // work that was going to run anyway.
+        //
+        // EXACTNESS. This moves WHEN the weights are fetched, never WHAT is
+        // fetched or in WHICH ORDER it is accumulated. `loader_w` performs the
+        // same sequence of loads (one prologue plus one per remaining tile,
+        // the same total as the stock loop) with the same `next()` cadence, so
+        // tile k holds the same dequantized values either way; the `kk1` loop
+        // issues the same `tile_matmad_nax` calls against the same `Atile` in
+        // the same k order. `Dtile` therefore accumulates an identical
+        // sequence of identical values and every output element is
+        // bit-identical to the stock loop's.
+        //
+        // ORDERING. One barrier per iteration is sufficient and necessary.
+        // Reaching it means every thread has finished consuming the tile it
+        // read last iteration, which is exactly the tile this iteration is
+        // about to overwrite, and that the tile this iteration consumes has
+        // been completely written by the previous iteration's prefetch.
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+        loader_w.next();
+        loader_w.advance_dst(tgp_tile_stride);
+        int dst_step = -tgp_tile_stride;
+        int cur = 0;
+
+        for (int k = 0; k < K; k += BK) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (k + BK < K) {
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(short2(BK, tgp_bn));
+            }
+            loader_w.next();
+            loader_w.advance_dst(dst_step);
+            dst_step = -dst_step;
+          }
+
+          threadgroup T* Wcur = Ws + cur * tgp_tile_stride;
+
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(x + kk1, K);
+            } else {
+              Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Wcur + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<transpose_a>{},
+                Btile,
+                metal::bool_constant<transpose_b>{});
+
+            (void)compiler_barrier;
+          }
+
+          x += BK;
+          cur ^= 1;
+        }
+      } else {
       for (int k = 0; k < K; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if constexpr (kAlignedN.value) {
@@ -1054,6 +1163,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
         x += BK;
         loader_w.next();
+      }
       }
 
       // Store results to device memory
@@ -1227,7 +1337,9 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  // Two staging tiles: the dense qmm_t path runs the double-buffered K
+  // pipeline below, which writes tile k+1 while tile k is being consumed.
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1247,7 +1359,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
+  qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN, true>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
