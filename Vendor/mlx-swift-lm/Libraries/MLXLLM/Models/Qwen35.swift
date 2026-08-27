@@ -1638,6 +1638,12 @@ private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
         const int xs_lane = int(xs_gid.x);
         const int xs_kb = int(xs_gid.y);
         const int xs_row = int(xs_gid.z);
+        // Packed launch: threadgroup (32, 8, 1) so eight k-blocks share one
+        // dispatch. Padding k-blocks (xs_kb * 512 >= K) return without a
+        // load or a store; in-range threads keep the stock address formula.
+        if (xs_kb * 512 >= xs_k) {
+            return;
+        }
         const device bfloat16_t* xm =
             x + xs_row * xs_k + xs_kb * 512 + xs_lane * 16;
         float s = 0.0f;
@@ -1798,10 +1804,16 @@ public enum Qwen35CustomQMV {
         let k = x.dim(-1)
         let m = x.size / k
         let kBlocks = k / 512
+        // Eight k-blocks per threadgroup: 8x fewer launches on the remaining
+        // 130 standalone fills (mlp.down K=17408 → 5 groups instead of 34).
+        // Grid.y is padded to a multiple of 8 because dispatch_threads
+        // requires it; the kernel guards padded k-blocks before any access.
+        let pack = 8
+        let kbPacked = ((kBlocks + pack - 1) / pack) * pack
         return qwen35CustomAffine4XSumsKernel(
             [x],
-            grid: (32, kBlocks, m),
-            threadGroup: (32, 1, 1),
+            grid: (32, kbPacked, m),
+            threadGroup: (32, pack, 1),
             outputShapes: [[kBlocks * 32 * sumsStride(m)]],
             outputDTypes: [.float32]
         )[0]
