@@ -1557,6 +1557,20 @@ private let qwen35E120QMVHeader = """
     }
     """
 
+/// `mlx-qwen38-ipg9-cap8` (hunk 1 of 2): M=9 wide-QMV group-count gate.
+/// `MLX_QWEN_IPG9=0` restores the shipped IPG=3 grouping at M=9 (3 groups,
+/// `vec<float,3>` accumulators in the two full groups); default flips to
+/// IPG=5 (2 groups: `wide<5>` main + `wide<4>` tail), the only entry in this
+/// table that does not already hit its `ceil(m / inputsPerGroup)` minimum
+/// under the `NA <= 5` lane-width ceiling every other width achieves.
+/// Neither `wide<5>` (M=5) nor `wide<4>` (M=4/7/8) is a new Metal template
+/// instantiation. This hunk alone is a structural null: M=9 is unreachable
+/// while `segmentedVerifyDepthCap == 7` (hunk 2 raises it to 8), so the two
+/// kill switches are independent but the mechanism only does anything when
+/// both are enabled together.
+private let qwen35Ipg9Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_IPG9"] != "0"
+
 /// Geometry and width switch shared by both QMV pipelines. `table` decides
 /// whether the chunk-sum table is a bound buffer at all: the four-input
 /// pipeline has no such buffer and passes a null pointer that `USE_TABLE =
@@ -1564,7 +1578,7 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, qwen35Ipg9Enabled ? 5 : 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1722,7 +1736,7 @@ public enum Qwen35CustomQMV {
         case 6: inputsPerGroup = 3
         case 7: inputsPerGroup = 4
         case 8: inputsPerGroup = 4
-        case 9: inputsPerGroup = 3
+        case 9: inputsPerGroup = qwen35Ipg9Enabled ? 5 : 3
         default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
         }
         return (m + inputsPerGroup - 1) / inputsPerGroup

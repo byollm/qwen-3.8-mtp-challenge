@@ -1038,7 +1038,18 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    ///
+    /// `mlx-qwen38-ipg9-cap8` (hunk 2 of 2): `MLX_QWEN_DEPTH_CAP_8=0` restores
+    /// the shipped cap of 7. Raising the cap alone was already measured at
+    /// -875 bips standalone (`mlx-qwen38-depth-cap-8`/P1, submission a13031f,
+    /// rejected 2026-08-27) -- verify width 9 forces a 2->3 pass step on
+    /// every wide QMV call of that round under the shipped M=9 IPG=3
+    /// grouping. This candidate pairs the raise with hunk 1 (`MLX_QWEN_IPG9`)
+    /// so width 9 stays inside the 2-pass plateau; do not enable this switch
+    /// alone.
+    private static let depthCap8Enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_DEPTH_CAP_8"] != "0"
+    private static let segmentedVerifyDepthCap = depthCap8Enabled ? 8 : 7
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
