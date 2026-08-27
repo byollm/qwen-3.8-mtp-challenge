@@ -367,23 +367,29 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
 
           const InT scale = is_q ? q_scale : k_scale;
           const uint output_base = (row * Hk + head) * Dk + lane * 4;
+          vec<bfloat16_t, 4> yv;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
             const InT rms = InT(1) * static_cast<InT>(
                 static_cast<float>(activated[i]) * local_inv_mean[0]);
-            const InT value = scale * rms;
-            if (is_q) {
-              q_out[output_base + i] = value;
-            } else {
-              k_out[output_base + i] = value;
-            }
+            yv[i] = scale * rms;
+          }
+          if (is_q) {
+            *reinterpret_cast<device vec<bfloat16_t, 4>*>(
+                q_out + output_base) = yv;
+          } else {
+            *reinterpret_cast<device vec<bfloat16_t, 4>*>(
+                k_out + output_base) = yv;
           }
         } else {
           const uint output_base = (row * Hv + head) * Dv + lane * 4;
+          vec<bfloat16_t, 4> yv;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
-            v_out[output_base + i] = activated[i];
+            yv[i] = activated[i];
           }
+          *reinterpret_cast<device vec<bfloat16_t, 4>*>(
+              v_out + output_base) = yv;
 
           if (lane == 0) {
             const ulong a_offset = ulong(row) * ulong(a_strides[1])
@@ -408,11 +414,18 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           const ulong raw_base = ulong(row) * ulong(qkv_strides[1])
               + ulong(channel_base + lane * 4) * ulong(qkv_strides[2]);
           const uint state_base = state_row * C + channel_base + lane * 4;
-          #pragma clang loop unroll(full)
-          for (uint i = 0; i < 4; ++i) {
-            conv_out[state_base + i] =
-                qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
+          vec<bfloat16_t, 4> cv;
+          if (qkv_strides[2] == 1) {
+            cv = *reinterpret_cast<const device vec<bfloat16_t, 4>*>(
+                qkv + raw_base);
+          } else {
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              cv[i] = qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
+            }
           }
+          *reinterpret_cast<device vec<bfloat16_t, 4>*>(
+              conv_out + state_base) = cv;
         }
         """
     return MLXFast.metalKernel(
