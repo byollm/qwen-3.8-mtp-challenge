@@ -55,6 +55,14 @@ import MLXLMCommon
 /// Loads and validates the separately pinned Qwen 3.6 MTP head alongside a
 /// backbone weights tree.
 public enum Qwen36MTPHeadAttachment {
+    private enum HeadKind {
+        case nativeMTP
+        case dFlash2
+    }
+
+    private static let dFlash2SelectorKey =
+        "candidate_selector.hidden_projection.weight"
+
     /// Tensors the pinned head revision (83795d54) carries. Single source of
     /// truth is `MLXFastConstants`, because the trusted CLI reports the same
     /// number in the evidence payload and links no model code.
@@ -158,11 +166,10 @@ public enum Qwen36MTPHeadAttachment {
         return try backboneLayout(configData: data)
     }
 
-    /// Run `body` with the head tree registered as an additional weight source,
-    /// the primary tree's key rewrite selected from its own config, and
-    /// `_qwen35MTPEnabled` set — restoring all three afterwards.
+    /// Run `body` with the native MTP or DFlash2 attachment selected from the
+    /// handed head, restoring every process-scoped load slot afterwards.
     ///
-    /// ALL THREE globals are restored on EVERY exit path. They are process-global
+    /// Every selected global is restored on EVERY exit path. They are process-global
     /// and read by the next load of any model; leaking one would silently change
     /// how an unrelated later load behaves, which on a worker that serves a
     /// reference replay after the candidate is exactly the kind of cross-phase
@@ -175,6 +182,25 @@ public enum Qwen36MTPHeadAttachment {
     ) throws -> T {
         let layout = try backboneLayout(directory: backboneDirectory)
         try verifyHeadTree(headDirectory)
+        let headKind = try headKind(headDirectory)
+        if case .dFlash2 = headKind {
+            let dFlash2 = try Qwen38DFlash2Runtime(headDirectory: headDirectory)
+            let previousSources = _additionalWeightSources
+            let previousStrip = _primaryWeightKeyPrefixStrip
+            let previousEnabled = _qwen35MTPEnabled
+            let previousDFlash2 = _qwen35DFlash2Attachment
+            _additionalWeightSources = []
+            _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
+            _qwen35MTPEnabled = false
+            _qwen35DFlash2Attachment = dFlash2
+            defer {
+                _additionalWeightSources = previousSources
+                _primaryWeightKeyPrefixStrip = previousStrip
+                _qwen35MTPEnabled = previousEnabled
+                _qwen35DFlash2Attachment = previousDFlash2
+            }
+            return try body(layout)
+        }
         let previousSources = _additionalWeightSources
         let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
@@ -190,6 +216,19 @@ public enum Qwen36MTPHeadAttachment {
             _qwen35MTPEnabled = previousEnabled
         }
         return try body(layout)
+    }
+
+    private static func headKind(_ headDirectory: URL) throws -> HeadKind {
+        let indexURL = headDirectory.appendingPathComponent(
+            "model.safetensors.index.json")
+        guard !FileManager.default.fileExists(atPath: indexURL.path) else {
+            return .nativeMTP
+        }
+        let safetensorsURL = headDirectory.appendingPathComponent(
+            "model.safetensors")
+        let names = try safetensorsTensorNames(safetensorsURL)
+        return names.contains(dFlash2SelectorKey)
+            ? .dFlash2 : .nativeMTP
     }
 
     /// Structural checks that do not need MLX and are therefore unit-testable.
@@ -256,7 +295,10 @@ public enum Qwen36MTPHeadAttachment {
                     + "(e.g. \(prefixed)); this loader merges a BARE head tree and "
                     + "would double-prefix a pre-merged one")
         }
-        for required in ["fc.weight", "norm.weight", "pre_fc_norm_hidden.weight"] {
+        let required = names.contains(dFlash2SelectorKey)
+            ? [dFlash2SelectorKey]
+            : ["fc.weight", "norm.weight", "pre_fc_norm_hidden.weight"]
+        for required in required {
             guard names.contains(required) else {
                 throw MLXFastError.invalidInput(
                     "the Qwen MTP head safetensors is missing \(required)")
