@@ -2730,6 +2730,11 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
 
+        // Park the energy-pass activations and reuse them on apply so the
+        // embedding half does not re-dequant and the hidden half does not
+        // reload b[]. Two r_start chunks * n_reads = at most 8 values.
+        float parked[8];
+        uint npark = 0;
         float acc = 0.0f;
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
@@ -2739,6 +2744,7 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
                         ? qwen35_embed_row_value(
                             e_weight, e_scales, e_biases, w_off, g_off, elem + i)
                         : float(b[in_off + elem + i]);
+                    parked[npark++] = xi;
                     acc += xi * xi;
                 }
             } else {
@@ -2749,6 +2755,7 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
                                 e_weight, e_scales, e_biases, w_off, g_off,
                                 elem + i)
                             : float(b[in_off + elem + i]);
+                        parked[npark++] = xi;
                         acc += xi * xi;
                     }
                 }
@@ -2776,25 +2783,19 @@ private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float inv_mean = local_inv_mean[0];
+        uint rpark = 0;
         for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
             uint elem = r_start + thread_id * n_reads;
             if (elem + n_reads <= axis_size) {
                 for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? qwen35_embed_row_value(
-                            e_weight, e_scales, e_biases, w_off, g_off, elem + i)
-                        : float(b[in_off + elem + i]);
+                    float xi = parked[rpark++];
                     bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                     concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                 }
             } else {
                 for (uint i = 0; i < n_reads; ++i) {
                     if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? qwen35_embed_row_value(
-                                e_weight, e_scales, e_biases, w_off, g_off,
-                                elem + i)
-                            : float(b[in_off + elem + i]);
+                        float xi = parked[rpark++];
                         bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                         concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                     }
