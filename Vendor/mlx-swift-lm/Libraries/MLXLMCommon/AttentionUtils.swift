@@ -1,6 +1,117 @@
 import Foundation
 import MLX
 
+private let qwen35WideSDPAKernel = MLXFast.metalKernel(
+    name: "qwen35_wide_sdpa_vector_bf16_v1",
+    inputNames: ["queries", "keys", "values"],
+    outputNames: ["out"],
+    source: """
+        constexpr int BN = 32;
+        constexpr int D = 256;
+        constexpr int per_thread = D / BN;
+        const int head = int(threadgroup_position_in_grid.x);
+        const int row = int(threadgroup_position_in_grid.y);
+        const int qL = int(queries_shape[2]);
+        const int N = int(keys_shape[2]);
+        const int kv_head = head / 6;
+        const int simd_group = int(simdgroup_index_in_threadgroup);
+        const int lane = int(thread_index_in_simdgroup);
+
+        const device bfloat16_t* q_ptr = queries
+            + ulong(head) * ulong(queries_strides[1])
+            + ulong(row) * ulong(queries_strides[2])
+            + ulong(lane * per_thread);
+        const device bfloat16_t* k_ptr = keys
+            + ulong(kv_head) * ulong(keys_strides[1])
+            + ulong(simd_group) * ulong(keys_strides[2])
+            + ulong(lane * per_thread);
+        const device bfloat16_t* v_ptr = values
+            + ulong(kv_head) * ulong(values_strides[1])
+            + ulong(simd_group) * ulong(values_strides[2])
+            + ulong(lane * per_thread);
+
+        float q[per_thread];
+        float k[per_thread];
+        float o[per_thread];
+        threadgroup float outputs[BN * BN];
+        threadgroup float max_scores[BN];
+        threadgroup float sum_exp_scores[BN];
+
+        for (int i = 0; i < per_thread; ++i) {
+            q[i] = 0.0625f * static_cast<float>(q_ptr[i]);
+            o[i] = 0.0f;
+        }
+
+        float max_score = -metal::numeric_limits<float>::max();
+        float sum_exp_score = 0.0f;
+        const long k_step = long(BN) * long(keys_strides[2]);
+        const long v_step = long(BN) * long(values_strides[2]);
+        for (int i = simd_group; i < N; i += BN) {
+            if (i <= N - qL + row) {
+                for (int j = 0; j < per_thread; ++j) {
+                    k[j] = static_cast<float>(k_ptr[j]);
+                }
+                float score = 0.0f;
+                for (int j = 0; j < per_thread; ++j) {
+                    score += q[j] * k[j];
+                }
+                score = simd_sum(score);
+                const float new_max = max(max_score, score);
+                const float factor = metal::fast::exp(max_score - new_max);
+                const float exp_score = metal::fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+                for (int j = 0; j < per_thread; ++j) {
+                    o[j] = o[j] * factor
+                        + exp_score * static_cast<float>(v_ptr[j]);
+                }
+            }
+            k_ptr += k_step;
+            v_ptr += v_step;
+        }
+
+        if (lane == 0) {
+            max_scores[simd_group] = max_score;
+            sum_exp_scores[simd_group] = sum_exp_score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_score = max_scores[lane];
+        const float new_max = simd_max(max_score);
+        const float factor = metal::fast::exp(max_score - new_max);
+        sum_exp_score = simd_sum(sum_exp_scores[lane] * factor);
+
+        for (int i = 0; i < per_thread; ++i) {
+            outputs[lane * BN + simd_group] = o[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_group * BN + lane] * factor);
+            o[i] = sum_exp_score == 0.0f ? o[i] : o[i] / sum_exp_score;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            const ulong base = ulong((head * qL + row) * D
+                + simd_group * per_thread);
+            for (int i = 0; i < per_thread; ++i) {
+                out[base + ulong(i)] = static_cast<bfloat16_t>(o[i]);
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+private func qwen35WideSDPA(
+    queries: MLXArray, keys: MLXArray, values: MLXArray
+) -> MLXArray {
+    let qL = queries.dim(2)
+    return qwen35WideSDPAKernel(
+        [queries, keys, values],
+        grid: (24 * 1024, qL, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [queries.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Attention utilities that match Python mlx-lm's interface
 ///
 /// This provides a single function that automatically routes to quantized or regular
@@ -119,6 +230,17 @@ public func attentionWithCacheUpdate(
         // are read-only views of that single committed candidate window.
         let qL = queries.dim(2)
         let kL = cachedKeys.dim(2)
+        if queries.dim(0) == 1, queries.dim(1) == 24,
+           cachedKeys.dim(1) == 4, queries.dim(3) == 256,
+           cachedKeys.dim(3) == 256, cachedValues.dim(3) == 256,
+           queries.dtype == .bfloat16, cachedKeys.dtype == .bfloat16,
+           cachedValues.dtype == .bfloat16, scale == 0.0625,
+           qL >= 6, qL <= 8, kL >= qL, kL < 1024,
+           case .causal = mask
+        {
+            return qwen35WideSDPA(
+                queries: queries, keys: cachedKeys, values: cachedValues)
+        }
         if queries.dim(0) == 1, qL >= 6, qL <= 9, kL >= qL,
            case .causal = mask
         {
