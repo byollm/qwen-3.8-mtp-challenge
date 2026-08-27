@@ -321,6 +321,7 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
                                           : 2 * Hk * Dk + head * Dv);
 
         InT activated[4];
+        InT qkv_row[4];
         float sumsq = 0.0f;
         #pragma clang loop unroll(full)
         for (uint i = 0; i < 4; ++i) {
@@ -337,6 +338,9 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
             const InT xv = input_row < NKeep
                 ? conv_state[input_offset]
                 : qkv[input_offset];
+            if (tap == 3) {
+              qkv_row[i] = xv;
+            }
             const ulong weight_offset =
                 ulong(channel) * ulong(conv_weight_strides[0])
                 + ulong(tap) * ulong(conv_weight_strides[1]);
@@ -405,13 +409,10 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
 
         if (row + NKeep >= uint(T)) {
           const uint state_row = row + NKeep - T;
-          const ulong raw_base = ulong(row) * ulong(qkv_strides[1])
-              + ulong(channel_base + lane * 4) * ulong(qkv_strides[2]);
           const uint state_base = state_row * C + channel_base + lane * 4;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
-            conv_out[state_base + i] =
-                qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
+            conv_out[state_base + i] = qkv_row[i];
           }
         }
         """
