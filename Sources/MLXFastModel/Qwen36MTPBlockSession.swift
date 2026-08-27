@@ -708,6 +708,42 @@ public final class Qwen36MTPBlockSession {
         Swift.min(offeredDepth, 1)
     }
 
+    /// Per-block confidence-gated MTP draft-skip policy. Wired through
+    /// `effectiveDraftPolicy` below so the base `draftPolicy` keeps its
+    /// contract while this knob re-routes the cost model through the
+    /// trailing accept-rate gate. Defaults to the no-op
+    /// `DraftSchedulePolicy.default`: a fresh `skipThreshold == 0.0` never
+    /// short-circuits, a fresh `fuseEmbedRoPE == false` keeps the head on its
+    /// shipped dispatch, and `residualReuseWindow == 16` matches the
+    /// cost-model's EMA half-life for the steady-state acceptance rate.
+    public var schedulePolicy: DraftSchedulePolicy = .default
+
+    /// What `generateRound` actually invokes. Wraps the assigned
+    /// `draftPolicy` with the per-block confidence gate: when the trailing
+    /// accept-rate over the last `schedulePolicy.residualReuseWindow` decided
+    /// rounds is below `schedulePolicy.skipThreshold`, the round declines to
+    /// draft (returns 0 = the serial control's exact one-token forward, with
+    /// no head work and no verify window). The round-by-round bookkeeping
+    /// (acceptedDraftTotal, rejectedDraftTotal, roundCount) is the source of
+    /// truth — the policy reads totals, not EMAs, so a hard reject in
+    /// `residualReuseWindow` rounds flips the gate on the next round, not
+    /// after a lag.
+    public var effectiveDraftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int {
+        { [weak self] offeredDepth, round in
+            guard let self else {
+                return Swift.min(offeredDepth, 1)
+            }
+            if self.schedulePolicy.shouldSkipDraft(
+                accepted: self.acceptedDraftTotal,
+                rejected: self.rejectedDraftTotal,
+                totalDecidedRounds: self.roundCount
+            ) {
+                return 0
+            }
+            return self.draftPolicy(offeredDepth, round)
+        }
+    }
+
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
     /// telemetry counter; the cost-model schedule below reads the per-position
     /// EMAs, not this.
