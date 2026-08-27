@@ -3864,20 +3864,22 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
     outputNames: ["token_id"],
     source: """
         constexpr uint TG_SIZE    = 256;
-        constexpr uint TOPK       = 32;
+        constexpr uint TOPK       = \(qwen35Top32K);
         constexpr uint SIMD_SIZE  = 32;
         constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+        constexpr uint ROWS_PER_TILE = TOPK / NSIMD;
         constexpr uint K          = 5120;
         constexpr uint K_WORDS    = 640;
         constexpr uint K_GROUPS   = 80;
         constexpr uint VALUES_PER_LANE = 16;
         constexpr uint BLOCK      = 512;
-        static_assert(NSIMD * 4 == TOPK, "one four-row dot tile per SIMDgroup");
+        static_assert(NSIMD * ROWS_PER_TILE == TOPK,
+                      "one dot tile per SIMDgroup must cover every candidate");
 
         uint lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
-        uint candidate_base = sg * 4;
-        float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float result[ROWS_PER_TILE];
+        for (uint r = 0; r < ROWS_PER_TILE; ++r) { result[r] = 0.0f; }
 
         for (uint k = 0; k < K; k += BLOCK) {
             float xv[VALUES_PER_LANE];
@@ -3891,8 +3893,8 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
                 xv[i + 2] = x[x_base + i + 2] / 256.0f;
                 xv[i + 3] = x[x_base + i + 3] / 4096.0f;
             }
-            for (uint r = 0; r < 4; ++r) {
-                uint row = uint(candidate_ids[candidate_base + r]);
+            for (uint r = 0; r < ROWS_PER_TILE; ++r) {
+                uint row = uint(candidate_ids[sg * ROWS_PER_TILE + r]);
                 uint word_base = row * K_WORDS + k / 8 + lane * 2;
                 uint p0 = weight[word_base];
                 uint p1 = weight[word_base + 1];
@@ -3916,24 +3918,26 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
         }
 
         threadgroup float exact_scores[TOPK];
-        for (uint r = 0; r < 4; ++r) {
+        for (uint r = 0; r < ROWS_PER_TILE; ++r) {
             float reduced = simd_sum(result[r]);
             if (lane == 0) {
-                exact_scores[candidate_base + r] = float(InT(reduced));
+                exact_scores[sg * ROWS_PER_TILE + r] = float(InT(reduced));
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        // All TOPK scores exist in exact_scores (NSIMD * ROWS_PER_TILE ==
+        // TOPK tiles above). sg 0 walks them serially under the incumbent
+        // strict (value, id) order — 64 comparisons, no duplicated dots.
         if (sg == 0) {
-            float best_value = exact_scores[lane];
-            uint best_id = uint(candidate_ids[lane]);
-            for (uint offset = 16; offset > 0; offset >>= 1) {
-                float other_value = simd_shuffle_down(best_value, offset);
-                uint other_id = simd_shuffle_down(best_id, offset);
-                if (lane < offset && qwen_draft_selected_rerank_better(
-                        other_value, other_id, best_value, best_id)) {
-                    best_value = other_value;
-                    best_id = other_id;
+            float best_value = exact_scores[0];
+            uint best_id = uint(candidate_ids[0]);
+            for (uint e = 1; e < TOPK; ++e) {
+                float v = exact_scores[e];
+                uint id = uint(candidate_ids[e]);
+                if (qwen_draft_selected_rerank_better(v, id, best_value, best_id)) {
+                    best_value = v;
+                    best_id = id;
                 }
             }
             if (lane == 0) {
@@ -3999,7 +4003,15 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
 // identity is a strictly stronger property and makes the offline gate a plain
 // array equality.
 private let qwen35Top32RealCount    = 98_330
-private let qwen35Top32K            = 32
+// WIDENED SHORTLIST 32 -> 48. The shortlist loses a position exactly when the
+// true best compact row misses the coarse-q2 top-K; the offline recall study
+// (/tmp/qwen_head_cal, dequant(affine4 lm_head) ground truth vs shipped q2
+// scores) shows those misses cluster just past rank 32, and the exact affine-4
+// rerank behind the shortlist prices 16 more rows at microseconds (one extra
+// dot tile per two SIMD groups, one wider host-side reduce). Selection kernels
+// are already template-parameterized on this constant; the rerank kernel reads
+// it through string interpolation below, so 32 and 48 stay one-edit switches.
+private let qwen35Top32K            = 64
 private let qwen35Top32TG           = 256
 private let qwen35Top32Tiles        = 64
 
@@ -5181,7 +5193,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 64
     // Derived cluster index. Eight rows per leaf and eight refinement passes
     // are the screened settings; the centroid table stays 2-bit like the rows
     // it indexes.
