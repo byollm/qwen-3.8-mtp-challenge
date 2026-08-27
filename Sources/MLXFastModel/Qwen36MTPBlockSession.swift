@@ -1068,6 +1068,34 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+    /// Consecutive FULL-accept rounds required before the ceiling opens from
+    /// `segmentedVerifyDepthCap` to one deeper. 0 disables (flat cap 7, the
+    /// previous behaviour). Measurement seam: `MLX_` passes the worker env
+    /// sanitizer, so one binary serves every arm.
+    ///
+    /// 5 is the screened value, chosen on the two DETERMINISTIC metrics only
+    /// (a 512-token declared-head window; counts, so thermally immune and
+    /// reproducible to four decimals):
+    ///
+    ///     gate  accepted_draft_rate  effective_mean_draft_len
+    ///        0             0.8645                     6.3544   (flat 7)
+    ///        2             0.8450                     6.7895
+    ///        3             0.8499                     6.7500
+    ///        5             0.8735                     6.4675
+    ///   flat 8             0.8453                     6.8933
+    ///
+    /// Gates 2 and 3 behave like the flat 8 the board already priced at
+    /// -0.134: longer drafts bought with a LOWER accept rate, i.e. more
+    /// width-9 rounds that then get rejected. 5 is the only setting that
+    /// raises BOTH -- the ceiling opens only where the head has already been
+    /// perfect five rounds running, so the extra draft is usually taken --
+    /// and it is also the setting with the least width-9 exposure.
+    private static let deepStreakGate: Int = {
+        if let raw = ProcessInfo.processInfo.environment["MLX_DEEP_STREAK_GATE"],
+           let v = Int(raw), v >= 0, v <= 64 { return v }
+        return 5
+    }()
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1104,7 +1132,28 @@ public final class Qwen36MTPBlockSession {
         //
         // Imported from promoted submission c6af1e24 (organizer 88578f92,
         // official 3.30955573); it supersedes ead84bba (official 3.30221310).
-        let widthCap = Self.segmentedVerifyDepthCap
+        // Streak-gated ceiling of 8 on top of the flat 7.
+        //
+        // The board's receipt for depth cap 8 (-0.134) is for a FLAT 8: every
+        // qualifying round asks the target for a width-9 verify, and width 9
+        // is where the wide path falls off a cliff the cost model cannot see
+        // (`sumsStride` alone steps 8 -> 16 there). This restores the ceiling
+        // in the GATED form this file's own comment describes -- "deep rounds
+        // only fire where the head has been perfect" -- so width 9 is reached
+        // only after `deepStreakGate` consecutive FULL-accept rounds and any
+        // reject resets it. Exposure to the cliff is therefore geometrically
+        // rare while the depth is bought exactly on the stretches whose
+        // marginal draft is most likely to be accepted.
+        //
+        // Countable, not predicted: the gate cannot fire on a cold or hard
+        // prompt at all, because `fullAcceptStreak` is reset by any reject.
+        // Width 9's EXACTNESS is not at issue -- measured `all_tokens_matched`
+        // with zero residual divergence over four 512-token local draws.
+        let deepen = Self.deepStreakGate > 0
+            && fullAcceptStreak >= Self.deepStreakGate
+        let widthCap = deepen
+            ? Swift.min(Self.segmentedVerifyDepthCap + 1, Qwen36MTPLimits.maxDepth)
+            : Self.segmentedVerifyDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
