@@ -1918,6 +1918,138 @@ func qwen35RoutedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
         groupSize: q.groupSize, bits: q.bits, mode: q.mode)
 }
 
+/// `MLX_QWEN_FA_OPROJ_XSUMS_FUSE=0` restores the eager
+/// `qwen35CompiledSigmoidMultiply(x, gate)` before `o_proj`'s own standalone
+/// `xsumsTable(x)` dispatch. Default on.
+///
+/// `fa.o_proj` is a QMV-routed consumer this module's chunk-sum-table fusion
+/// has never reached: `mlp.gate_up`, `gdn.in_proj` and `fa.qkv` all read
+/// directly off a fused RMSNorm's `normed` output and inherit its published
+/// table (`qwen35FusedResidualRMSNormXSumsKernel`), and `mlp.down` /
+/// `gdn.out_proj` now each carry their own producer epilogue (see the
+/// sibling `mlx-qwen38-mlp-down-xsums-fuse` /
+/// `mlx-qwen38-gdn-postnorm-xsums-fuse` mechanisms) -- but `o_proj`'s
+/// activation is `output * sigmoid(gate)`
+/// (`qwen35CompiledSigmoidMultiply`'s own body, full-attention layers only),
+/// a gated elementwise pass with no upstream producer, so it has paid a
+/// standalone `qwen35_custom_affine4_g64_xsums_v1` dispatch every
+/// full-attention call since the table mechanism landed (this comment
+/// block's own per-shape measurement table above lists `fa.o_proj` among
+/// the fills that still pay). `attentionHeads * headDim = 24 * 256 = 6144`
+/// (`Tests/Fixtures/Qwen3627B4bit/config-contract.json`'s
+/// `num_attention_heads` / `head_dim`) is divisible by 512, inside the
+/// table's own `k % 512 == 0` requirement. `MLX_` prefix is load-bearing:
+/// the trusted worker's environment sanitizer drops `MLXFAST_*`.
+private let qwen35FAOProjXSumsFuseEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_FA_OPROJ_XSUMS_FUSE"] != "0"
+
+/// `x * sigmoid(gate)` plus the chunk-sum table of the bf16 result, in one
+/// launch.
+///
+/// Arithmetic: matches `qwen35CompiledSigmoidMultiply`'s own body exactly --
+/// `x * sigmoid(gate)`, one native `bfloat16_t` multiply against a
+/// `bfloat16_t` sigmoid (no fp32 promotion in the compiled graph's
+/// expression, so none here either). `sigmoid`'s branched form
+/// (`unary_ops.h`'s `Sigmoid::operator()`, `1 / (1 + exp(abs(x)))`
+/// sign-adjusted) is `template <typename T> T operator()(T x)` in the
+/// vendored Metal tree -- one formula for any scalar type it is
+/// instantiated on, so it is the identical expression MLX's own compiled
+/// graph lowers to for a bf16 operand, not a shortcut borrowed from a
+/// different kernel. The chunk-sum epilogue is
+/// `qwen35_custom_affine4_g64_xsums_v1`'s body copied verbatim onto the
+/// bytes this pass just wrote, the same technique
+/// `qwen35FusedResidualRMSNormSource(emitSums:)` already uses for the norm
+/// producers: write loop over `width` in `lsize * n_reads`-sized chunks, a
+/// device-scope barrier, then the identical four-`vec<bfloat16_t,4>`-load
+/// accumulation over the 16-element group this iteration just wrote.
+private let qwen35FAOProjGateXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fa_oproj_gate_xsums_v1",
+    inputNames: ["x", "gate"],
+    outputNames: ["out", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+
+        uint width = uint(x_shape[x_ndim - 1]);
+        uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        ulong offset = ulong(row) * ulong(width);
+
+        for (uint r_start = 0; r_start < width; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            uint n = (elem < width) ? min(n_reads, width - elem) : 0u;
+            for (uint i = 0; i < n; ++i) {
+                bfloat16_t gate_v = gate[offset + elem + i];
+                bfloat16_t sig_y =
+                    bfloat16_t(1) / (bfloat16_t(1) + metal::exp(metal::abs(gate_v)));
+                bfloat16_t sig =
+                    (gate_v < bfloat16_t(0)) ? sig_y : (bfloat16_t(1) - sig_y);
+                bfloat16_t xv = x[offset + elem + i];
+                out[offset + elem + i] = xv * sig;
+            }
+
+            threadgroup_barrier(mem_flags::mem_device);
+            uint xs_elem = r_start + thread_id * 16;
+            if (thread_id < lsize / 4 && xs_elem + 16 <= width) {
+                const device bfloat16_t* xm = out + offset + xs_elem;
+                float s = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                        const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                    s += xv[0] + xv[1] + xv[2] + xv[3];
+                }
+                uint xs_kb = xs_elem / 512;
+                uint xs_lane = (xs_elem % 512) / 16;
+                xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Routes `Qwen35Attention`'s full-attention output gate through
+/// `qwen35FAOProjGateXSumsKernel` when the result both qualifies for a
+/// published chunk-sum table (the same test `Qwen35XSumsSidecar.wants`
+/// applies to a norm producer's output, evaluated here inline against `x`'s
+/// own shape) and the switch is not disabled; falls back to the untouched
+/// `qwen35CompiledSigmoidMultiply(x, gate)` in every other case, so a failed
+/// guard costs nothing beyond the shipped dispatch. Callers pass `x` and
+/// `gate` already reshaped to `[..., attentionHeads * headDim]` -- reshape
+/// commutes with this elementwise function, so reshaping once before the
+/// call instead of once after produces identical values, and it is what
+/// lets the published table's identity survive to `o_proj`'s own
+/// `qwen35RoutedLinear` call with no reshape in between.
+func qwen35AttnOutputGateWithXSums(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
+    let width = x.dim(-1)
+    let rows = x.size / width
+    guard qwen35FAOProjXSumsFuseEnabled,
+        x.dtype == .bfloat16,
+        gate.dtype == .bfloat16,
+        gate.shape == x.shape,
+        width % 512 == 0,
+        Qwen35CustomQMV.arm == .sumTable,
+        Qwen35CustomQMV.widths.contains(rows),
+        Qwen35CustomQMV.tablePays(m: rows),
+        x.dim(-2) == rows
+    else {
+        return qwen35CompiledSigmoidMultiply(x, gate)
+    }
+    let kBlocks = width / 512
+    let outputs = qwen35FAOProjGateXSumsKernel(
+        [x, gate],
+        grid: (rows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            x.shape, [kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)],
+        ],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    Qwen35XSumsSidecar.publish(x: outputs[0], table: outputs[1])
+    return outputs[0]
+}
+
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -3391,7 +3523,8 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
 
         return qwen35RoutedLinear(
-            oProj, qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+            oProj, qwen35AttnOutputGateWithXSums(
+                output.reshaped(B, L, -1), gate.reshaped(B, L, -1)))
     }
 }
 
