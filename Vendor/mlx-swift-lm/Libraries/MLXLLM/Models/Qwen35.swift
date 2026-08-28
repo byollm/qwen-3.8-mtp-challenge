@@ -189,6 +189,13 @@ private let qwen35CompiledGatedDeltaGBeta:
     return body
 }()
 
+/// Kill switch for `qwen35GDNFusedQKScale` below (the S == 2 MTP-verify
+/// prework's q/k RMSNorm scale). Default on; "0" restores the prior
+/// two-dispatch form (separate `qScaleConst * rmsNorm(...)`) unchanged.
+/// `MLX_` prefix is load-bearing: the worker sanitizer drops `MLXFAST_*`.
+private let qwen35GDNFusedQKScaleEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_GDN_QKSCALE_FUSE"] != "0"
+
 /// Run the existing recurrence kernel from already-computed fp32 `g`/`beta`.
 /// The official M5 path uses this after the compiled helper; callers retain the
 /// original `gatedDeltaUpdate` fallback when compiled decode is disabled.
@@ -614,6 +621,29 @@ private let qwen35GatedDeltaReplayStateKernel: MLXFast.MLXFastKernel? = {
     )
 }()
 
+/// `mlx-qwen38-replay-state-template-reuse`: kill switch and cached
+/// `template:` argument for `qwen35GatedDeltaReplayState`'s dispatch below.
+/// Every entry in that dispatch's template literal is a source literal, not
+/// derived from any call argument — `Dk`/`Dv`/`Hk`/`Hv` are pinned by the
+/// function's own `k.dim(2)==16, k.dim(3)==128, v.dim(2)==48, v.dim(3)==128`
+/// guard just above the dispatch, and `StT` is always `.float32` (the fixed
+/// accumulator dtype). Unlike the sibling `gdn-mid`/`gdn-mixer`
+/// template-reuse mechanisms, this cache needs no per-call mutation at all:
+/// built once, handed to every dispatch unchanged. Kill switch
+/// `MLX_QWEN_REPLAY_STATE_TEMPLATE_REUSE=0` restores the pristine per-call
+/// literal byte-for-byte.
+private let qwen35GatedDeltaReplayStateTemplateReuseEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_REPLAY_STATE_TEMPLATE_REUSE"]
+        != "0"
+
+private let qwen35GatedDeltaReplayStateTemplate: [(String, any KernelTemplateArg)] = [
+    ("StT", DType.float32),
+    ("Dk", 128),
+    ("Dv", 128),
+    ("Hk", 16),
+    ("Hv", 48),
+]
+
 /// Boundary recurrent state after `T` replayed rows, without the dead output.
 /// Returns nil for any shape or dtype the clone was not proved against, which
 /// keeps the caller on the vendored two-output kernel.
@@ -642,15 +672,21 @@ private func qwen35GatedDeltaReplayState(
     guard preparedState.shape == [1, 48, 128, 128] else { return nil }
 
     let T = k.dim(1)
-    let outputs = kernel(
-        [k, v, g, beta, preparedState, MLXArray(T)],
-        template: [
+    let template: [(String, any KernelTemplateArg)]
+    if qwen35GatedDeltaReplayStateTemplateReuseEnabled {
+        template = qwen35GatedDeltaReplayStateTemplate
+    } else {
+        template = [
             ("StT", DType.float32),
             ("Dk", 128),
             ("Dv", 128),
             ("Hk", 16),
             ("Hv", 48),
-        ],
+        ]
+    }
+    let outputs = kernel(
+        [k, v, g, beta, preparedState, MLXArray(T)],
+        template: template,
         grid: (32, 128, 48),
         threadGroup: (32, 4, 1),
         outputShapes: [preparedState.shape],
@@ -926,6 +962,74 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
+    /// Kill switch for `processChunkStashingPrefix`'s eager-fallback (`mixerHit
+    /// == false`) q/k RMSNorm scale fuse below — the branch that runs whenever
+    /// the packed mixer kernel's tight geometry/dtype/hardware envelope isn't
+    /// met (`S` outside `[3,9]`, `nKeep != 3`, unsupported compiled-decode
+    /// hardware, etc.). NOT the `mixerHit == true` branch, which computes
+    /// q/k inside `qwen35PackedGDNPreworkKernel` itself and has no separate
+    /// scale multiply to fuse. NOT the sibling flags
+    /// `qwen35GDNFusedQKScaleEnabled` / `MLX_QWEN_GDN_QKSCALE_FUSE` (the
+    /// `S == 2` `qwen35GatedDeltaMidKernel` branch) or
+    /// `gdnPrefixFusedQKScaleEnabled` / `MLX_QWEN_GDN_PREFIX_QKSCALE_FUSE`
+    /// (`processChunk`'s own standard single-chunk path) — this is the third,
+    /// independent call site of the identical two-dispatch pattern, in a
+    /// different method of this same class that neither sibling flag reaches.
+    /// Default on; "0" restores the prior two-dispatch form (separate
+    /// `qScaleConst * rmsNorm(...)`) unchanged. `MLX_` prefix is load-bearing:
+    /// the worker sanitizer drops `MLXFAST_*`.
+    private static let gdnStashPrefixFusedQKScaleEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_GDN_STASHPREFIX_QKSCALE_FUSE"] != "0"
+
+    /// `mlx-qwen38-gdn-mixer-template-reuse`: cache slot for the packed-mixer
+    /// kernel's `template:` argument, mutated in place across calls instead
+    /// of rebuilt as a fresh seven-tuple array literal on every `mixerHit`
+    /// call below. Five of the seven entries (`Hk`/`Dk`/`Hv`/`Dv`/`NKeep`)
+    /// describe this layer's fixed geometry and never change after `init`;
+    /// only `C` (the packed qkv channel width) and `T` (the verify window
+    /// width `S`) are read fresh from the call's own arguments and written
+    /// into the cached array's last two slots before every dispatch. Kill
+    /// switch `MLX_QWEN_GDN_MIXER_TEMPLATE_REUSE=0` restores the pristine
+    /// per-call literal byte-for-byte.
+    private static let gdnMixerTemplateReuseEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_GDN_MIXER_TEMPLATE_REUSE"]
+            != "0"
+
+    /// Backing storage for the cache above. `lazy` so it is built once, on
+    /// this instance's first `mixerHit` call, from `self`'s own fixed
+    /// geometry — untouched, and never allocated, when the kill switch is
+    /// off (the `else` branch below never reads this property).
+    private lazy var gdnMixerTemplateScratch: [(String, Int)] = [
+        ("Hk", numKHeads), ("Dk", headKDim),
+        ("Hv", numVHeads), ("Dv", headVDim),
+        ("NKeep", convKernelSize - 1), ("C", 0), ("T", 0),
+    ]
+
+    /// `mlx-qwen38-gdn-mid-template-reuse`: cache slot for the width-2
+    /// verify mid-kernel's `template:` argument, mutated in place across
+    /// calls instead of rebuilt as a fresh six-tuple array literal on every
+    /// S==2 verify dispatch. Four of the six entries (`Dk`/`Dv`/`Hk`/`Hv`)
+    /// describe this layer's fixed geometry and never change after `init`;
+    /// `StT` is always `.float32` (the kernel's own fixed accumulator
+    /// dtype, never derived from an input). Only `InT` (the row dtype) is
+    /// read fresh from `dtype` and written into the cached array's first
+    /// slot before every dispatch. Kill switch
+    /// `MLX_QWEN_GDN_MID_TEMPLATE_REUSE=0` restores the pristine per-call
+    /// literal byte-for-byte.
+    private static let gdnMidTemplateReuseEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_GDN_MID_TEMPLATE_REUSE"]
+            != "0"
+
+    /// Backing storage for the cache above. `lazy` so it is built once, on
+    /// this instance's first S==2 verify call, from `self`'s own fixed
+    /// geometry — untouched, and never allocated, when the kill switch is
+    /// off (the `else` branch below never reads this property).
+    private lazy var gdnMidTemplateScratch: [(String, any KernelTemplateArg)] = [
+        ("InT", DType.bfloat16), ("StT", DType.float32),
+        ("Dk", headKDim), ("Dv", headVDim),
+        ("Hk", numKHeads), ("Hv", numVHeads),
+    ]
+
     /// Single-chunk verify twin that retains only the ingredients needed to
     /// reconstruct a committed recurrent prefix after the target acceptance
     /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
@@ -964,15 +1068,23 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState: MLXArray
         if mixerHit {
             let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
+            let template: [(String, Int)]
+            if Self.gdnMixerTemplateReuseEnabled {
+                gdnMixerTemplateScratch[5].1 = qkv.dim(2)
+                gdnMixerTemplateScratch[6].1 = S
+                template = gdnMixerTemplateScratch
+            } else {
+                template = [
+                    ("Hk", numKHeads), ("Dk", headKDim),
+                    ("Hv", numVHeads), ("Dv", headVDim),
+                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                ]
+            }
             let outs = qwen35PackedGDNPreworkKernel(
                 [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
                  qScaleConst,
                  kScaleConst],
-                template: [
-                    ("Hk", numKHeads), ("Dk", headKDim),
-                    ("Hv", numVHeads), ("Dv", headVDim),
-                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
-                ],
+                template: template,
                 grid: (32, S, 2 * numKHeads + numVHeads),
                 threadGroup: (32, 1, 1),
                 outputShapes: [
@@ -1006,12 +1118,31 @@ final class Qwen35GatedDeltaNet: Module {
 
             let dtype = q.dtype
             let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-            qNormed =
-                qScaleConst
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            kNormed =
-                kScaleConst
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            if Self.gdnStashPrefixFusedQKScaleEnabled {
+                // Fold the scalar scale into rmsNorm's OWN per-element weight
+                // multiply instead of a separate elementwise-multiply launch
+                // afterward. Identical technique and identical bit-exactness
+                // argument as the sibling flags' call sites: `weight:
+                // broadcast(qScaleConst, to: [headKDim])` is a `[headKDim]`
+                // VIEW backed by the single scalar element (stride 0), so
+                // `mlx::core::fast::rms_norm`'s `weight.ndim()==1 &&
+                // weight.size()==headKDim` check passes on the logical shape
+                // while the kernel reads the same scalar `headKDim` times —
+                // zero extra allocation, zero extra dispatch, same
+                // per-element arithmetic and rounding as the two-dispatch
+                // form it replaces.
+                qNormed = MLXFast.rmsNorm(
+                    q, weight: broadcast(qScaleConst, to: [headKDim]), eps: 1e-6)
+                kNormed = MLXFast.rmsNorm(
+                    k, weight: broadcast(kScaleConst, to: [headKDim]), eps: 1e-6)
+            } else {
+                qNormed =
+                    qScaleConst
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                kNormed =
+                    kScaleConst
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            }
 
             // Keep the recurrence and conv prologue wide. The promoted
             // compiled g/beta launch reduction feeds the same single
@@ -1205,12 +1336,35 @@ final class Qwen35GatedDeltaNet: Module {
 
             let dtype = q.dtype
             let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-            let qNormed =
-                qScaleConst
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                kScaleConst
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let qNormed: MLXArray
+            let kNormed: MLXArray
+            if qwen35GDNFusedQKScaleEnabled {
+                // Fold the scalar scale into rmsNorm's OWN per-element weight
+                // multiply instead of a separate elementwise-multiply launch
+                // afterward. `MLXFast.rmsNorm`'s `weight` must be
+                // one-dimensional with size == the normalized axis
+                // (`headKDim`); `broadcast(_:to:)` gives a `[headKDim]` VIEW
+                // backed by the same single scalar element (stride 0), so the
+                // kernel reads `qScaleConst`/`kScaleConst` `headKDim` times
+                // instead of a real per-channel array being materialized —
+                // zero extra allocation, zero extra dispatch. Same arithmetic
+                // as the two-dispatch form (`qScaleConst * rmsNorm(x, weight:
+                // none)`): one multiply per element either way, just moved
+                // inside the kernel that already does the normalize. Bit-
+                // identical — broadcasting never changes an operand value,
+                // only how many times the same value is read.
+                qNormed = MLXFast.rmsNorm(
+                    q, weight: broadcast(qScaleConst, to: [headKDim]), eps: 1e-6)
+                kNormed = MLXFast.rmsNorm(
+                    k, weight: broadcast(kScaleConst, to: [headKDim]), eps: 1e-6)
+            } else {
+                qNormed =
+                    qScaleConst
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                kNormed =
+                    kScaleConst
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            }
 
             // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
             // serving the gate's input-independent factor from the layer memo.
@@ -1221,16 +1375,23 @@ final class Qwen35GatedDeltaNet: Module {
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
             if state.dtype != .float32 { state = state.asType(.float32) }
 
-            let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
-                template: [
+            let template: [(String, any KernelTemplateArg)]
+            if Self.gdnMidTemplateReuseEnabled {
+                gdnMidTemplateScratch[0].1 = dtype
+                template = gdnMidTemplateScratch
+            } else {
+                template = [
                     ("InT", dtype),
                     ("StT", DType.float32),
                     ("Dk", headKDim),
                     ("Dv", headVDim),
                     ("Hk", numKHeads),
                     ("Hv", numVHeads),
-                ],
+                ]
+            }
+            let outputs = midKernel(
+                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
+                template: template,
                 grid: (32, headVDim, B * numVHeads),
                 threadGroup: (32, 4, 1),
                 outputShapes: [
@@ -1756,6 +1917,44 @@ public enum Qwen35CustomQMV {
 
     public static func tablePays(m: Int) -> Bool { m >= minimumTableWidth }
 
+    /// Kill switches. `MLX_QWEN_FUSED_TABLE_M3=0` / `MLX_QWEN_FUSED_TABLE_M2=0`
+    /// each independently drop their own width back to `minimumTableWidth`'s
+    /// routing, restoring today's shipped routing byte for byte when both are
+    /// `0`. Both default on.
+    private static let fusedTableM3Enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_FUSED_TABLE_M3"] != "0"
+    private static let fusedTableM2Enabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_FUSED_TABLE_M2"] != "0"
+
+    /// `ec24d59`'s fused-norm producer (`Qwen35XSumsSidecar`) emits a
+    /// chunk-sum table as a free epilogue side effect for every activation it
+    /// writes. A table that free does not carry the standalone fill's -90 us
+    /// tax the comment above declined for M=3, so the width a *fused-produced*
+    /// table pays at can sit below `minimumTableWidth`. E120 rung 5d's own
+    /// grid shows exactly three M=3 cells go negative against the standalone
+    /// fill -- `mlp.gate_up`, `gdn.in_proj`, `fa.qkv` -- each by less than one
+    /// fill dispatch, so a free table at M=3 is a net win for all three.
+    /// `mlx-qwen38-fused-table-m2` extends the identical fill-vs-epilogue
+    /// argument one width lower: `qwen35FusedResidualRMSNormXSumsKernel`
+    /// publishes at M=2 exactly as it does at every other width in
+    /// `Qwen35CustomQMV.widths`, and `sumsStride(2) == 8`, identical to
+    /// `sumsStride(3...8)` -- no geometry special-case at the lower bound.
+    /// `fusedTableWidth` is the LOWER of whichever kill switches are on
+    /// (`2` beats `3` beats the shipped `4`): `M2` on subsumes `M3`'s own
+    /// M=3 coverage (`m >= 2` already implies `m >= 3`), so the two compose
+    /// by disjoint-union-of-coverage, not by summed effect, and turning `M2`
+    /// off alone degrades cleanly to `M3`'s exact prior behavior. Every
+    /// M>=4 cell already pays under `minimumTableWidth` regardless, and
+    /// this constant never raises that bar, only ever lowers it.
+    public static let fusedTableWidth: Int =
+        fusedTableM2Enabled ? 2 : (fusedTableM3Enabled ? 3 : minimumTableWidth)
+
+    /// `tablePays`, but for a table a producer's epilogue already published.
+    /// This only ever gates a `Qwen35XSumsSidecar.take()` hit that already
+    /// exists -- it must never justify a new standalone `xsumsTable(x)` fill,
+    /// which is exactly the -90 us at M=3 the tree already rejected.
+    public static func tablePaysFused(m: Int) -> Bool { m >= fusedTableWidth }
+
     /// True when the last two dimensions are densely packed, so the kernel's
     /// `row * rowStride + col` indexing reads the buffer as it stands.
     public static func rowContiguous(_ a: MLXArray, rowStride: Int) -> Bool {
@@ -1855,20 +2054,38 @@ public enum Qwen35CustomQMV {
                 groupSize: groupSize, bits: bits, mode: mode)
         else { return nil }
 
-        if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
-            // The fused-norm producer publishes the chunk-sum table for the
-            // activation it just wrote, so the shipped `sumtable` arm skips
-            // the standalone fill dispatch for those cells and pays it for
-            // every other one. `fill_noconsume` exists to price that fill, so
-            // it always launches it.
-            let fused =
-                arm == .sumTable
-                ? Qwen35XSumsSidecar.take(x, k: cell.k, m: cell.m) : nil
+        if arm == .fillNoConsume {
+            // Always launches the standalone fill; exists only to price it.
             return matmulWithTable(
                 x, w, scales: scales, biases: biases,
-                xsums: fused ?? xsumsTable(x),
+                xsums: xsumsTable(x),
                 groupSize: groupSize, bits: bits, mode: mode,
-                consume: arm == .sumTable)
+                consume: false)
+        }
+
+        if arm == .sumTable {
+            // Probe the sidecar before the width test: a table the fused-norm
+            // producer's epilogue already emitted is free to consume at any
+            // width `tablePaysFused` clears, even one `tablePays` alone
+            // declines. An M=3 cell with no published table falls through to
+            // the direct dispatch below unchanged -- never `xsumsTable(x)` at
+            // M=3, that standalone fill is the -90 us the tree already
+            // rejected.
+            let fused = Qwen35XSumsSidecar.take(x, k: cell.k, m: cell.m)
+            if let fused, tablePaysFused(m: cell.m) {
+                return matmulWithTable(
+                    x, w, scales: scales, biases: biases,
+                    xsums: fused,
+                    groupSize: groupSize, bits: bits, mode: mode,
+                    consume: true)
+            }
+            if tablePays(m: cell.m) {
+                return matmulWithTable(
+                    x, w, scales: scales, biases: biases,
+                    xsums: fused ?? xsumsTable(x),
+                    groupSize: groupSize, bits: bits, mode: mode,
+                    consume: true)
+            }
         }
 
         var outShape = x.shape
@@ -2379,8 +2596,9 @@ func qwen35FusedResidualRMSNorm(
 /// `xsumsTable`, so every path that does not pass through a publishing
 /// producer keeps today's dispatch exactly.
 ///
-/// Only the shipped `sumtable` arm publishes, and only at row counts the
-/// table pays at (`Qwen35CustomQMV.minimumTableWidth ... widths.upperBound`).
+/// Only the shipped `sumtable` arm publishes, and only at row counts a
+/// fused-produced table pays at (`Qwen35CustomQMV.fusedTableWidth ...
+/// widths.upperBound`).
 /// `M = 1` -- the serial leg, which the candidate leg shares -- never reaches
 /// the variant kernel, so the serial path is byte-for-byte the shipped one.
 enum Qwen35XSumsSidecar {
@@ -2415,7 +2633,7 @@ enum Qwen35XSumsSidecar {
         let k = x.dim(-1)
         let rows = x.size / k
         return Qwen35CustomQMV.widths.contains(rows)
-            && Qwen35CustomQMV.tablePays(m: rows)
+            && Qwen35CustomQMV.tablePaysFused(m: rows)
             && x.dim(-2) == rows
             && k % 512 == 0
     }
@@ -4334,6 +4552,21 @@ public nonisolated(unsafe) var qwen35RowTop32ArgPartitionDrafts: Int = 0
 /// `unset`, `0` or `1`, for the same trace line.
 public var qwen35RowTop32GateSource: String { qwen35RowTop32Resolved.source }
 
+/// `MLX_QWEN_ROWTOP32_COUNTER_GATE=0` restores unconditional increments of
+/// the two counters above on every draft step. Default on: both counters
+/// are read ONLY inside `Qwen36MTPBlockSession.generateRound`'s
+/// `Self.traceRounds` block (`MLX_QWEN_MTP_TRACE=1`, "Never on in a ranked
+/// run" per that file's own comment) -- writing them on a run where
+/// tracing is off updates a value nothing will ever read. `MLXFastModel`
+/// depends on this target, not the reverse, so this file cannot see
+/// `Qwen36MTPBlockSession.traceRounds` directly; the check below reads the
+/// identical `MLX_QWEN_MTP_TRACE` env var it reads, by the same rule.
+private let qwen35RowTop32CounterGateEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_ROWTOP32_COUNTER_GATE"] != "0"
+
+private let qwen35MTPTraceEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
@@ -5791,10 +6024,18 @@ extension Qwen35TextModel: MTPCapable {
         ).reshaped([probes * rowsPerCluster])
 
         if let rowTop32 = _draftRowTop32 {
-            qwen35RowTop32FusedDrafts += 1
+            if qwen35RowTop32CounterGateEnabled {
+                if qwen35MTPTraceEnabled { qwen35RowTop32FusedDrafts += 1 }
+            } else {
+                qwen35RowTop32FusedDrafts += 1
+            }
             return rowTop32(rowScore, probed, perm)
         }
-        qwen35RowTop32ArgPartitionDrafts += 1
+        if qwen35RowTop32CounterGateEnabled {
+            if qwen35MTPTraceEnabled { qwen35RowTop32ArgPartitionDrafts += 1 }
+        } else {
+            qwen35RowTop32ArgPartitionDrafts += 1
+        }
 
         let kth = probes * rowsPerCluster - candidateCount
         let local = MLX.argPartition(rowScore, kth: kth)[.ellipsis, (kth)...]
@@ -5805,6 +6046,26 @@ extension Qwen35TextModel: MTPCapable {
         // uint32 to match what `qwen35DraftTop32` hands the shared exact stage.
         return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
     }
+
+    /// `mlx-qwen38-rerank-template-reuse`: cached `template:` argument for
+    /// `qwen35DraftSelectedAffine4RerankKernel`'s declared-rerank dispatch
+    /// (`draftTokenIDWithDeclaredRerank`, called on every declared-head
+    /// draft round). Both entries, `PREFIX_COUNT` and `CONTROL_OFFSET`, are
+    /// `Self` static constants — identical on every call for the whole
+    /// process, unlike the sibling GDN template-reuse mechanisms (which
+    /// still mutate one per-call slot). This needs no mutation at all: the
+    /// two-tuple array is built once, lazily, and handed to every
+    /// subsequent dispatch unchanged. Kill switch
+    /// `MLX_QWEN_RERANK_TEMPLATE_REUSE=0` restores the pristine per-call
+    /// literal byte-for-byte.
+    private static let rerankTemplateReuseEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_RERANK_TEMPLATE_REUSE"]
+            != "0"
+
+    private static let rerankTemplateScratch: [(String, any KernelTemplateArg)] = [
+        ("PREFIX_COUNT", compactDraftPrefixCount),
+        ("CONTROL_OFFSET", compactDraftControlStart - compactDraftPrefixCount),
+    ]
 
     private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
         if _draftClusterShape == nil, !_derivedClusterAttempted {
@@ -5866,14 +6127,20 @@ extension Qwen35TextModel: MTPCapable {
             }
         }
 
-        return qwen35DraftSelectedAffine4RerankKernel(
-            [x.reshaped([configuration.hiddenSize]), candidateIDs,
-             exact.weight, exact.scales, exactBiases],
-            template: [
+        let template: [(String, any KernelTemplateArg)]
+        if Self.rerankTemplateReuseEnabled {
+            template = Self.rerankTemplateScratch
+        } else {
+            template = [
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
-            ],
+            ]
+        }
+        return qwen35DraftSelectedAffine4RerankKernel(
+            [x.reshaped([configuration.hiddenSize]), candidateIDs,
+             exact.weight, exact.scales, exactBiases],
+            template: template,
             grid: (256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[1, 1]],

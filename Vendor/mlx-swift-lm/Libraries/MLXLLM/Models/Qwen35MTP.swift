@@ -27,6 +27,25 @@ public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 let qwen35FusedEmbedConcatEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E85_FUSED_EMBED"] != "0"
 
+/// E121 arm gate. `MLX_QWEN_MTP_HEAD_NORM_FUSE=0` restores the eager
+/// `norm(h + mlpOut)` pair at the MTP head's own tail (both
+/// `MTPModule.callAsFunction` and `lastHiddenWithKVOnlyHistory`) instead of
+/// folding the exit add into the head's final RMSNorm launch. Same `MLX_`
+/// prefix reasoning as `MLX_E85_FUSED_EMBED` above: `MLXFAST_*` is stripped
+/// by the trusted worker's sandbox before the scored process ever sees it.
+let qwen35MTPHeadNormFuseEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_MTP_HEAD_NORM_FUSE"] != "0"
+
+/// `MLX_QWEN_E85_GEOMETRY_CACHE=0` restores `preFcConcat`'s full per-call
+/// guard chain byte-for-byte, recomputing every sub-check below on every
+/// draft substep. Default on: the sub-checks this flag skips depend only on
+/// `embedTokens`'s own quantization layout (mode/bits/groupSize/dtypes/zero-
+/// point shape) and the two head-side RMSNorm `eps` values, none of which
+/// can change once the module and its embedding table are constructed, so
+/// re-deriving the same `true` on every call is pure repeated work.
+let qwen35E85GeometryCacheEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_E85_GEOMETRY_CACHE"] != "0"
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -64,6 +83,23 @@ final class Qwen35MTPDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
+        let (h, mlpOut) = residualAndMLPOutput(x, mask: mask, cache: cache)
+        return h + mlpOut
+    }
+
+    /// Same computation as `callAsFunction`, but returns the pre-final-add
+    /// `(h, mlpOut)` pair instead of merging them. A caller whose very next
+    /// step is an RMSNorm (both `MTPModule` call sites below: this is the
+    /// LAST -- here the only -- layer in the head) can then fuse that merge
+    /// into the norm's own launch via `qwen35FusedResidualRMSNorm` instead of
+    /// paying a standalone add. `h + mlpOut` here is bit-identical to
+    /// `callAsFunction`'s return, so a caller that just adds the pair back
+    /// together gets the exact old behavior.
+    func residualAndMLPOutput(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (h: MLXArray, mlpOut: MLXArray) {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         // The backbone's decoder layer has fused this residual+norm boundary
@@ -78,10 +114,10 @@ final class Qwen35MTPDecoderLayer: Module {
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
+            return (h, (mlp as! UnaryLayer)(postAttnNorm))
         }
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -128,6 +164,41 @@ final class Qwen35MTPModule: Module {
         super.init()
     }
 
+    /// Cache slot for `e85StaticGateOK`, keyed by the embedding table's
+    /// identity so a swapped table (never happens in this single-model
+    /// session, but the guard costs one pointer compare) recomputes instead
+    /// of trusting a stale answer.
+    private var _e85StaticGateCache: (ObjectIdentifier, Bool)?
+
+    /// The subset of `preFcConcat`'s E85 guard that depends only on
+    /// `quantized`'s own layout and `self`'s two RMSNorm `eps` values —
+    /// never on the per-call `hidden`/`nextTokenIds` shapes, which stay live
+    /// checks at the call site. Same conjuncts as the pristine guard, just
+    /// unrolled here, so a kill-switch flip changes only whether the answer
+    /// is cached, never what is checked.
+    private func e85StaticGateOK(_ quantized: QuantizedEmbedding) -> Bool {
+        func compute() -> Bool {
+            guard quantized.mode == .affine, quantized.bits == 4,
+                  quantized.groupSize == 64,
+                  let biases = quantized.biases,
+                  quantized.weight.dtype == .uint32,
+                  quantized.scales.dtype == .bfloat16,
+                  biases.dtype == .bfloat16,
+                  biases.shape == quantized.scales.shape,
+                  preFcNormEmbedding.eps == preFcNormHidden.eps
+            else { return false }
+            return true
+        }
+        guard qwen35E85GeometryCacheEnabled else { return compute() }
+        let identity = ObjectIdentifier(quantized)
+        if let cached = _e85StaticGateCache, cached.0 == identity {
+            return cached.1
+        }
+        let ok = compute()
+        _e85StaticGateCache = (identity, ok)
+        return ok
+    }
+
     /// Dual RMSNorm written straight into the `[e | h]` layout `fc` consumes.
     /// Same arithmetic as `qwen35DualRMSNorm` + `concatenated([e, h], -1)`;
     /// the extra concat launch is gone. Proposal-only.
@@ -141,21 +212,15 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         if qwen35FusedEmbedConcatEnabled,
            let quantized = embedTokens as? QuantizedEmbedding,
-           quantized.mode == .affine, quantized.bits == 4,
-           quantized.groupSize == 64,
            let zeroPoints = quantized.biases,
+           e85StaticGateOK(quantized),
            hidden.dtype == .bfloat16, hidden.dim(-1) == 5120,
-           quantized.weight.dtype == .uint32,
            quantized.weight.dim(1) * 8 == hidden.dim(-1),
-           quantized.scales.dtype == .bfloat16,
            quantized.scales.dim(1) * 64 == hidden.dim(-1),
-           zeroPoints.dtype == .bfloat16,
-           zeroPoints.shape == quantized.scales.shape,
            nextTokenIds.dtype == .int32,
            nextTokenIds.ndim == 2, nextTokenIds.dim(0) == 1,
            nextTokenIds.strides.last == 1,
-           nextTokenIds.dim(1) * hidden.dim(-1) == hidden.size,
-           preFcNormEmbedding.eps == preFcNormHidden.eps
+           nextTokenIds.dim(1) * hidden.dim(-1) == hidden.size
         {
             return qwen35EmbedDualRMSNormConcat(
                 ids: nextTokenIds,
@@ -201,14 +266,30 @@ final class Qwen35MTPModule: Module {
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
-        for (i, layer) in layers.enumerated() {
+        // 3. Run every layer but the last eagerly; fuse the last layer's
+        //    exit add into the head's own final RMSNorm launch below instead
+        //    of paying both separately (`mtpNumHiddenLayers` ships as 1, so
+        //    in practice this loop runs zero times and every draft step
+        //    goes straight to the fused tail).
+        guard let lastIndex = layers.indices.last else { return norm(fused) }
+        for i in layers.indices where i != lastIndex {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
-            fused = layer(fused, mask: mask, cache: c)
+            fused = layers[i](fused, mask: mask, cache: c)
         }
-
+        let lastCache: (any KVCache)? = lastIndex < cache.count ? cache[lastIndex] : nil
+        let (h, mlpOut) = layers[lastIndex].residualAndMLPOutput(
+            fused, mask: mask, cache: lastCache)
+        if qwen35MTPHeadNormFuseEnabled, h.dtype == .bfloat16, mlpOut.dtype == .bfloat16,
+           h.dim(-1) == 5120
+        {
+            // 4. Return pre-lm_head hidden (norm applied; lm_head is in
+            // TextModel) -- fused with the exit add, one launch not two.
+            return qwen35FusedResidualRMSNorm(
+                x: h, r: mlpOut, weight: norm.weight, eps: norm.eps
+            ).normed
+        }
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
-        return norm(fused)
+        return norm(h + mlpOut)
     }
 
     /// Run one proposal flush while omitting leading-row outputs that have no
@@ -237,7 +318,16 @@ final class Qwen35MTPModule: Module {
 
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
-        return norm(layers[0](current, mask: mask, cache: cache[0]))
+        let (h, mlpOut) = layers[0].residualAndMLPOutput(
+            current, mask: mask, cache: cache[0])
+        if qwen35MTPHeadNormFuseEnabled, h.dtype == .bfloat16, mlpOut.dtype == .bfloat16,
+           h.dim(-1) == 5120
+        {
+            return qwen35FusedResidualRMSNorm(
+                x: h, r: mlpOut, weight: norm.weight, eps: norm.eps
+            ).normed
+        }
+        return norm(h + mlpOut)
     }
 
 }
