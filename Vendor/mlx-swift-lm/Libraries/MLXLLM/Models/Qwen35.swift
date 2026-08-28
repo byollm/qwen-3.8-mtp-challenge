@@ -1315,11 +1315,12 @@ final class Qwen35GatedDeltaNet: Module {
         let normedOut: MLXArray
         if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            normedOut = qwen35GdnPostNormWithXSums(
+                rmsOut.reshaped(B, S, -1), z.reshaped(B, S, -1))
         } else {
-            normedOut = norm(out, gate: z)
+            normedOut = norm(out, gate: z).reshaped(B, S, -1)
         }
-        return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
+        return qwen35RoutedLinear(outProj, normedOut)
     }
 }
 
@@ -1916,6 +1917,137 @@ func qwen35RoutedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
     return qwen35RoutedQuantizedMM(
         x, q.weight, scales: q.scales, biases: z,
         groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+}
+
+/// `MLX_QWEN_GDN_POSTNORM_XSUMS_FUSE=0` restores the eager
+/// `qwen35CompiledGatedDeltaPostNorm(x, gate)` before `out_proj`'s own
+/// standalone `xsumsTable(x)` dispatch. Default on.
+///
+/// `gdn.out_proj` is the one QMV-routed consumer on the S >= 2 (candidate-
+/// leg-only) verify path this module's chunk-sum-table fusion has never
+/// reached: `mlp.gate_up`, `gdn.in_proj` and `fa.qkv` all read directly off
+/// a fused RMSNorm's `normed` output and inherit its published table
+/// (`qwen35FusedResidualRMSNormXSumsKernel`), but `out_proj`'s activation is
+/// `(gate * sigmoid(gate)) * rmsOut` -- a gated nonlinearity computed in
+/// fp32 after the norm (`qwen35CompiledGatedDeltaPostNorm`'s own body), with
+/// no upstream producer -- so it has paid a standalone
+/// `qwen35_custom_affine4_g64_xsums_v1` dispatch every S >= 2 GatedDeltaNet
+/// call since the table mechanism landed. `valueDim = 128 * 48 = 6144`
+/// (`linear_value_head_dim * linear_num_value_heads`,
+/// `Tests/Fixtures/Qwen3627B4bit/config-contract.json`) is divisible by
+/// 512, inside the table's own `k % 512 == 0` requirement. The S == 1
+/// branch (`norm(out, gate: z)`) is untouched -- it never reaches this
+/// function. `MLX_` prefix is load-bearing: the trusted worker's
+/// environment sanitizer drops `MLXFAST_*`.
+private let qwen35GdnPostNormXSumsFuseEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_GDN_POSTNORM_XSUMS_FUSE"] != "0"
+
+/// `(gate * sigmoid(gate)) * x` in fp32, plus the chunk-sum table of the
+/// bf16 result, in one launch.
+///
+/// Arithmetic: matches `qwen35CompiledGatedDeltaPostNorm`'s own body
+/// exactly -- `gate32 = gate.asType(.float32)`, `activated = gate32 *
+/// sigmoid(gate32)`, `return (activated * x.asType(.float32)).asType(
+/// x.dtype)`. `sigmoid`'s branched form (`unary_ops.h`'s
+/// `Sigmoid::operator()`, `1 / (1 + exp(abs(x)))` sign-adjusted) is
+/// `template <typename T> T operator()(T x)` in the vendored Metal tree --
+/// one formula for any scalar type it is instantiated on, so it is the
+/// identical expression MLX's own compiled graph lowers to for a float32
+/// operand, not a bf16-only shortcut borrowed from a different kernel.
+/// The final `.asType(x.dtype)` narrowing is the same truncate-to-nearest
+/// `bfloat16_t` conversion Metal performs for the explicit cast this
+/// kernel writes. The chunk-sum epilogue is
+/// `qwen35_custom_affine4_g64_xsums_v1`'s body copied verbatim onto the
+/// bytes this pass just wrote, the same technique
+/// `qwen35FusedResidualRMSNormSource(emitSums:)` already uses for the norm
+/// producers: write loop over `width` in `lsize * n_reads`-sized chunks, a
+/// device-scope barrier, then the identical four-`vec<bfloat16_t,4>`-load
+/// accumulation over the 16-element group this iteration just wrote.
+private let qwen35GatedDeltaPostNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_gdn_postnorm_xsums_v1",
+    inputNames: ["x", "gate"],
+    outputNames: ["out", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+
+        uint width = uint(x_shape[x_ndim - 1]);
+        uint xs_stride = threadgroups_per_grid.x <= 8u ? 8u : 16u;
+        ulong offset = ulong(row) * ulong(width);
+
+        for (uint r_start = 0; r_start < width; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            uint n = (elem < width) ? min(n_reads, width - elem) : 0u;
+            for (uint i = 0; i < n; ++i) {
+                float gate32 = float(gate[offset + elem + i]);
+                float sig_y = 1.0f / (1.0f + metal::exp(metal::abs(gate32)));
+                float sig = (gate32 < 0.0f) ? sig_y : (1.0f - sig_y);
+                float activated = gate32 * sig;
+                float xv = float(x[offset + elem + i]);
+                out[offset + elem + i] = bfloat16_t(activated * xv);
+            }
+
+            threadgroup_barrier(mem_flags::mem_device);
+            uint xs_elem = r_start + thread_id * 16;
+            if (thread_id < lsize / 4 && xs_elem + 16 <= width) {
+                const device bfloat16_t* xm = out + offset + xs_elem;
+                float s = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const vec<bfloat16_t, 4> xv = *reinterpret_cast<
+                        const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                    s += xv[0] + xv[1] + xv[2] + xv[3];
+                }
+                uint xs_kb = xs_elem / 512;
+                uint xs_lane = (xs_elem % 512) / 16;
+                xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Routes `Qwen35GatedDeltaNet`'s S >= 2 post-norm gate through
+/// `qwen35GatedDeltaPostNormXSumsKernel` when the result both qualifies for
+/// a published chunk-sum table (the same test `Qwen35XSumsSidecar.wants`
+/// applies to a norm producer's output, evaluated here inline against `x`'s
+/// own shape) and the switch is not disabled; falls back to the untouched
+/// `qwen35CompiledGatedDeltaPostNorm(x, gate)` in every other case, so a
+/// failed guard costs nothing beyond the shipped dispatch. Callers pass `x`
+/// and `gate` already reshaped to `[..., valueDim]` -- reshape commutes
+/// with this elementwise function, so reshaping once before the call
+/// instead of once after produces identical values, and it is what lets
+/// the published table's identity survive to `out_proj`'s own
+/// `qwen35RoutedLinear` call with no reshape in between.
+func qwen35GdnPostNormWithXSums(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
+    let width = x.dim(-1)
+    let rows = x.size / width
+    guard qwen35GdnPostNormXSumsFuseEnabled,
+        x.dtype == .bfloat16,
+        gate.dtype == .bfloat16,
+        gate.shape == x.shape,
+        width % 512 == 0,
+        Qwen35CustomQMV.arm == .sumTable,
+        Qwen35CustomQMV.widths.contains(rows),
+        Qwen35CustomQMV.tablePays(m: rows),
+        x.dim(-2) == rows
+    else {
+        return qwen35CompiledGatedDeltaPostNorm(x, gate)
+    }
+    let kBlocks = width / 512
+    let outputs = qwen35GatedDeltaPostNormXSumsKernel(
+        [x, gate],
+        grid: (rows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            x.shape, [kBlocks * 32 * Qwen35CustomQMV.sumsStride(rows)],
+        ],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    Qwen35XSumsSidecar.publish(x: outputs[0], table: outputs[1])
+    return outputs[0]
 }
 
 final class Qwen35FusedMLP: Module, UnaryLayer {
