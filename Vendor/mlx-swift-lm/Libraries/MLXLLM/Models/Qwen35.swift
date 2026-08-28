@@ -4622,7 +4622,28 @@ private let qwen35ProbeSortEnabled: Bool =
 /// ranked receipt `02742bf0` promoted this cut on the same cluster/index
 /// lineage; the later wide-QMV launch overlay removed the literal but does not
 /// overlap the proposal-side retrieval path restored here.
-private let qwen35DerivedClusterProbeFraction: Double = 0.15
+///
+/// `MLX_QWEN_CLUSTER_PROBE_FRACTION=0` restores that promoted 0.15 fraction
+/// byte-for-byte. Unset (default) continues the SAME validated direction one
+/// step further, 0.15 -> 0.12: `02742bf0`'s own promoted receipt already
+/// established that narrowing this fraction (0.25 -> 0.15, by the row-count
+/// arithmetic above) is a net win on this exact cluster/index lineage, so
+/// this is not a fresh, untested axis, it is the same axis's next untested
+/// point. `probes = ceil(0.12 * 12292) = 1476` (vs 1844 today), still
+/// comfortably clearing every guard `clusterCandidateIDs` enforces
+/// (`probes >= 1`, `probes <= clusters`, `probes * rowsPerCluster >
+/// candidateCount`: 1476/12292/11808 vs the required >32) — no shape this
+/// widens or narrows changes kind, only how many of the 12,292 leaves get
+/// probed before the SAME exact affine-4 reranker and 32-row shortlist
+/// selection run unchanged. Read once, at the untimed warm first draft
+/// proposal (`buildDerivedClusterIndex` below), so a scored run pays one
+/// environment lookup for the whole session, not one per draft step.
+private let qwen35DerivedClusterProbeFraction: Double = {
+    if ProcessInfo.processInfo.environment["MLX_QWEN_CLUSTER_PROBE_FRACTION"] == "0" {
+        return 0.15
+    }
+    return 0.12
+}()
 
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
