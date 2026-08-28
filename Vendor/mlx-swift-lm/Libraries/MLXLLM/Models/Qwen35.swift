@@ -2156,6 +2156,210 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - FA Q/K RMS+RoPE + V layout pack (decode)
+
+/// Same Q/K contract as `qwen35_attention_qk_rms_rope_bf16_v1`, plus a
+/// third row class that writes contiguous `[B, Hv, L, D]` V. V is not
+/// RMS-normalized and not RoPE'd. Each V threadgroup is independent of
+/// the Q/K RMS tree (one row = one threadgroup), so Q/K bytes stay the
+/// shipped fused path. Fail-closed callers keep the eager V transpose.
+private let qwen35AttentionQKVRMSRoPESource = """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint rotary_dimensions = 64;
+        constexpr uint rotary_pairs = rotary_dimensions / 2;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint batch_size = uint(q_shape[0]);
+        uint sequence_length = uint(q_shape[1]);
+        uint query_heads = uint(q_shape[2]);
+        uint key_heads = uint(k_shape[2]);
+        uint value_heads = uint(v_shape[2]);
+        uint axis_size = uint(q_shape[3]);
+        uint query_rows = batch_size * query_heads * sequence_length;
+        uint key_rows = batch_size * key_heads * sequence_length;
+        bool is_query = row < query_rows;
+        bool is_key = (!is_query) && (row < query_rows + key_rows);
+        bool is_value = !is_query && !is_key;
+        uint local_row = is_query
+            ? row
+            : (is_key ? (row - query_rows) : (row - query_rows - key_rows));
+        uint head_count = is_query
+            ? query_heads
+            : (is_key ? key_heads : value_heads);
+        uint batch = local_row / (head_count * sequence_length);
+        uint head_sequence = local_row % (head_count * sequence_length);
+        uint head = head_sequence / sequence_length;
+        uint sequence = head_sequence % sequence_length;
+        ulong output_base = ulong(local_row) * ulong(axis_size);
+        uint first = thread_id * n_reads;
+
+        if (is_value) {
+            ulong input_base = ulong(batch) * ulong(v_strides[0])
+                + ulong(sequence) * ulong(v_strides[1])
+                + ulong(head) * ulong(v_strides[2]);
+            ulong input_axis_stride = ulong(v_strides[3]);
+            for (uint i = 0; i < n_reads; ++i) {
+                uint element = first + i;
+                if (element < axis_size) {
+                    ulong index = input_base + ulong(element) * input_axis_stride;
+                    v_out[output_base + ulong(element)] = v[index];
+                }
+            }
+            return;
+        }
+
+        ulong input_base;
+        ulong input_axis_stride;
+        ulong weight_stride;
+        if (is_query) {
+            input_base = ulong(batch) * ulong(q_strides[0])
+                + ulong(sequence) * ulong(q_strides[1])
+                + ulong(head) * ulong(q_strides[2]);
+            input_axis_stride = ulong(q_strides[3]);
+            weight_stride = ulong(q_weight_strides[0]);
+        } else {
+            input_base = ulong(batch) * ulong(k_strides[0])
+                + ulong(sequence) * ulong(k_strides[1])
+                + ulong(head) * ulong(k_strides[2]);
+            input_axis_stride = ulong(k_strides[3]);
+            weight_stride = ulong(k_weight_strides[0]);
+        }
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+        threadgroup bfloat normalized[256];
+
+        float acc = 0.0f;
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = input_base + ulong(element) * input_axis_stride;
+                float value = is_query ? float(q[index]) : float(k[index]);
+                acc += value * value;
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = input_base + ulong(element) * input_axis_stride;
+                bfloat input_value = is_query ? q[index] : k[index];
+                bfloat rms_value = bfloat(float(input_value) * inv_mean);
+                bfloat weight = is_query
+                    ? q_weight[ulong(element) * weight_stride]
+                    : k_weight[ulong(element) * weight_stride];
+                normalized[element] = weight * rms_value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element >= rotary_dimensions && element < axis_size) {
+                if (is_query) {
+                    q_out[output_base + ulong(element)] = normalized[element];
+                } else {
+                    k_out[output_base + ulong(element)] = normalized[element];
+                }
+            }
+        }
+
+        if (thread_id < rotary_pairs / n_reads) {
+            for (uint i = 0; i < n_reads; ++i) {
+                uint pair = first + i;
+                float d = float(pair) / float(rotary_pairs);
+                float inv_freq = metal::exp2(-d * float(log2_base));
+                float position = float(int(sequence) + int(offset));
+                float theta = position * inv_freq;
+                float costheta = metal::fast::cos(theta);
+                float sintheta = metal::fast::sin(theta);
+                float x1 = float(normalized[pair]);
+                float x2 = float(normalized[pair + rotary_pairs]);
+                bfloat rx1 = bfloat(x1 * costheta - x2 * sintheta);
+                bfloat rx2 = bfloat(x1 * sintheta + x2 * costheta);
+                if (is_query) {
+                    q_out[output_base + ulong(pair)] = rx1;
+                    q_out[output_base + ulong(pair + rotary_pairs)] = rx2;
+                } else {
+                    k_out[output_base + ulong(pair)] = rx1;
+                    k_out[output_base + ulong(pair + rotary_pairs)] = rx2;
+                }
+            }
+        }
+        """
+
+private let qwen35AttentionQKVRMSRoPEKernel = MLXFast.metalKernel(
+    name: "qwen35_attention_qkv_rms_rope_bf16_v1",
+    inputNames: ["q", "k", "v", "q_weight", "k_weight", "eps", "offset", "log2_base"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: qwen35AttentionQKVRMSRoPESource,
+    ensureRowContiguous: false
+)
+
+/// Q/K as `qwen35AttentionQKRMSRoPE`; V is a layout pack of `[B,L,Hv,D]`
+/// into row-contiguous `[B,Hv,L,D]`. Nil is not used — callers fail closed
+/// onto the two-output kernel plus eager V transpose.
+func qwen35AttentionQKVRMSRoPE(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    offset: Int,
+    log2Base: Float
+) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
+    let B = queries.dim(0)
+    let L = queries.dim(1)
+    let queryHeads = queries.dim(2)
+    let keyHeads = keys.dim(2)
+    let valueHeads = values.dim(2)
+    let D = queries.dim(3)
+    let qRows = B * L * queryHeads
+    let kRows = B * L * keyHeads
+    let vRows = B * L * valueHeads
+    let totalRows = qRows + kRows + vRows
+    let grid = (totalRows * 64, 1, 1)
+    let threadGroup = (64, 1, 1)
+    let qOutShape = [B, queryHeads, L, D]
+    let kOutShape = [B, keyHeads, L, D]
+    let vOutShape = [B, valueHeads, L, D]
+    let outputs = qwen35AttentionQKVRMSRoPEKernel(
+        [queries, keys, values, qWeight, kWeight, eps, offset, log2Base],
+        grid: grid,
+        threadGroup: threadGroup,
+        outputShapes: [qOutShape, kOutShape, vOutShape],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 // MARK: - Fused residual + RMS norm (PR #250 mechanism, receipt 2.9083)
 
 /// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
@@ -3340,12 +3544,40 @@ final class Qwen35Attention: Module {
         var values = valuesIn
 
         keys = keys.reshaped(B, L, kvHeads, -1)
-        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        let valuesBLHD = values.reshaped(B, L, kvHeads, -1)
 
         let hasArrayOffset = cache is CompilableRotatingKVCache
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
+           L <= 32,
+           !hasArrayOffset,
+           queries.dtype == .bfloat16,
+           keys.dtype == .bfloat16,
+           valuesBLHD.dtype == .bfloat16,
+           qNorm.weight.dtype == .bfloat16,
+           kNorm.weight.dtype == .bfloat16,
+           queries.shape == [B, L, attentionHeads, headDim],
+           keys.shape == [B, L, kvHeads, headDim],
+           valuesBLHD.shape == [B, L, kvHeads, headDim],
+           qNorm.weight.shape == [headDim],
+           kNorm.weight.shape == [headDim],
+           qNorm.eps == kNorm.eps
+        {
+            let prepared = qwen35AttentionQKVRMSRoPE(
+                queries: queries,
+                keys: keys,
+                values: valuesBLHD,
+                qWeight: qNorm.weight,
+                kWeight: kNorm.weight,
+                eps: qNorm.eps,
+                offset: cache?.offset ?? 0,
+                log2Base: ropeLog2Base
+            )
+            queries = prepared.queries
+            keys = prepared.keys
+            values = prepared.values
+        } else if usesFusedQKPreparation,
            L <= 32,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
@@ -3358,6 +3590,7 @@ final class Qwen35Attention: Module {
            kNorm.weight.shape == [headDim],
            qNorm.eps == kNorm.eps
         {
+            values = valuesBLHD.transposed(0, 2, 1, 3)
             let prepared = qwen35AttentionQKRMSRoPE(
                 queries: queries,
                 keys: keys,
@@ -3370,6 +3603,7 @@ final class Qwen35Attention: Module {
             queries = prepared.queries
             keys = prepared.keys
         } else {
+            values = valuesBLHD.transposed(0, 2, 1, 3)
             queries = qNorm(queries).transposed(0, 2, 1, 3)
             keys = kNorm(keys).transposed(0, 2, 1, 3)
             queries = applyRotaryPosition(rope, to: queries, cache: cache)
