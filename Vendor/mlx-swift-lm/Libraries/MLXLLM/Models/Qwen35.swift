@@ -1423,7 +1423,7 @@ private let qwen35CompiledFusedSwiGLU:
 /// accumulation of the same BF16 expression tree, in the same `i` order, so the
 /// two paths agree bit for bit.
 private let qwen35E120QMVHeader = """
-    template <int NA, bool USE_TABLE>
+    template <int NA, int RPS, bool USE_TABLE>
     inline void qwen_e120_qmv_wide(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -1439,7 +1439,7 @@ private let qwen35E120QMVHeader = """
         uint simd_lid
     ) {
         typedef vec<float, NA> VF;
-        constexpr int rows_per_simd = 4;
+        constexpr int rows_per_simd = RPS;
         constexpr int values_per_thread = 16;
         constexpr int block_size = values_per_thread * 32;
         constexpr int bytes_per_lane = 8;
@@ -1524,7 +1524,7 @@ private let qwen35E120QMVHeader = """
         }
     }
 
-    template <int M, int IPG, bool USE_TABLE>
+    template <int M, int IPG, int RPS, bool USE_TABLE>
     inline void qwen_e120_qmv_m(
         const device uint32_t* w,
         const device bfloat16_t* scales,
@@ -1546,16 +1546,32 @@ private let qwen35E120QMVHeader = """
             return;
         }
         if (TAIL == 0 || M - first_m >= IPG) {
-            qwen_e120_qmv_wide<IPG, USE_TABLE>(
+            qwen_e120_qmv_wide<IPG, RPS, USE_TABLE>(
                 w, scales, biases, x, xsums, y, in_vec_size, out_vec_size,
                 sums_stride, first_m, out_row, simd_lid);
         } else {
-            qwen_e120_qmv_wide<(TAIL >= 2 ? TAIL : 2), USE_TABLE>(
+            qwen_e120_qmv_wide<(TAIL >= 2 ? TAIL : 2), RPS, USE_TABLE>(
                 w, scales, biases, x, xsums, y, in_vec_size, out_vec_size,
                 sums_stride, first_m, out_row, simd_lid);
         }
     }
     """
+
+/// `mlx-qwen38-rps2-single-pass-m678`: at M = 6, 7 and 8 the shipped IPG
+/// table (3, 4, 4) still splits the weight/scale/bias stream into 2 passes
+/// (`groups = ceil(M / IPG)`), because `qwen_e120_qmv_wide`'s own addressing
+/// (`ws = w + row * in_vec_size_w + k / 2 + ...`, `group_index = row *
+/// in_vec_size_g + ...`) never mentions `first_m` -- every x-group re-streams
+/// the whole weight/scale/bias matrix. Collapsing those three widths to
+/// `IPG = M` (one pass, one group) halves that stream at the cost of a
+/// `rows_per_simd = 2` register footprint (62/71/80 words at NA = 6/7/8,
+/// still under the 81-word maximum the shipped M = 5 case already compiles
+/// and ships). M = 2..5 and 9 are untouched: they are already single-pass,
+/// so they would only pay the doubled activation re-read this trades away
+/// for nothing. `MLX_QWEN_RPS2_M678=0` restores the shipped IPG = 3/4/4,
+/// `rows_per_simd = 4` grouping byte-for-byte.
+private let qwen35Rps2M678Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_QWEN_RPS2_M678"] != "0"
 
 /// Geometry and width switch shared by both QMV pipelines. `table` decides
 /// whether the chunk-sum table is a bound buffer at all: the four-input
@@ -1564,15 +1580,26 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
-        .map { m, ipg in
+    let cases:
+        [(m: Int, ipg: Int, rps: Int)] = [
+            (2, 2, 4), (3, 3, 4), (4, 4, 4), (5, 5, 4),
+            (6, qwen35Rps2M678Enabled ? 6 : 3, qwen35Rps2M678Enabled ? 2 : 4),
+            (7, qwen35Rps2M678Enabled ? 7 : 4, qwen35Rps2M678Enabled ? 2 : 4),
+            (8, qwen35Rps2M678Enabled ? 8 : 4, qwen35Rps2M678Enabled ? 2 : 4),
+            (9, 3, 4),
+        ]
+    let casesSource = cases
+        .map { m, ipg, rps in
             """
-                    case \(m):
-                        qwen_e120_qmv_m<\(m), \(ipg), \(flag)>(
+                    case \(m): {
+                        const int qmv_out_row =
+                            int(qmv_tid.y) * \(2 * rps) + int(qmv_sgid) * \(rps);
+                        qwen_e120_qmv_m<\(m), \(ipg), \(rps), \(flag)>(
                             w, scales, biases, x, \(sums), y,
                             qmv_k, qmv_n, qmv_stride,
                             qmv_gx, qmv_out_row, qmv_lid);
                         break;
+                    }
             """
         }
         .joined(separator: "\n")
@@ -1585,10 +1612,9 @@ private func qwen35E120QMVSource(table: Bool) -> String {
             const uint3 qmv_tid = threadgroup_position_in_grid;
             const uint qmv_lid = thread_index_in_simdgroup;
             const uint qmv_sgid = simdgroup_index_in_threadgroup;
-            const int qmv_out_row = int(qmv_tid.y) * 8 + int(qmv_sgid) * 4;
             const int qmv_gx = int(qmv_tid.x);\(nullDecl)
             switch (qmv_m) {
-        \(cases)
+        \(casesSource)
                 default:
                     break;
             }
@@ -1719,13 +1745,24 @@ public enum Qwen35CustomQMV {
         case 3: inputsPerGroup = 3
         case 4: inputsPerGroup = 4
         case 5: inputsPerGroup = 5
-        case 6: inputsPerGroup = 3
-        case 7: inputsPerGroup = 4
-        case 8: inputsPerGroup = 4
+        case 6: inputsPerGroup = qwen35Rps2M678Enabled ? 6 : 3
+        case 7: inputsPerGroup = qwen35Rps2M678Enabled ? 7 : 4
+        case 8: inputsPerGroup = qwen35Rps2M678Enabled ? 8 : 4
         case 9: inputsPerGroup = 3
         default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
         }
         return (m + inputsPerGroup - 1) / inputsPerGroup
+    }
+
+    /// `rows_per_simd` the compiled kernel case for width `m` actually uses
+    /// (`qwen35E120QMVSource`'s `cases` table, kept in lockstep with this by
+    /// construction: both read `qwen35Rps2M678Enabled`). The launch grid's y
+    /// extent is derived from it, so a caller that used the shipped `8` here
+    /// unconditionally would submit half as many threadgroups as the M = 6,
+    /// 7, 8 kernel case now expects and silently drop the top half of every
+    /// such matvec's output rows.
+    static func rowsPerSimd(_ m: Int) -> Int {
+        qwen35Rps2M678Enabled && (6...8).contains(m) ? 2 : 4
     }
 
     /// The chunk-sum table costs one fill dispatch, measured at 4 to 6 us and
@@ -1782,6 +1819,18 @@ public enum Qwen35CustomQMV {
         }
         let m = x.size / k
         guard Self.widths.contains(m), x.dim(-2) == m else { return nil }
+        // `rows_per_simd` halves to 2 at M = 6, 7, 8 when the RPS2 mechanism
+        // is enabled, and the launch grid's y extent then needs `n % (2 *
+        // rowsPerSimd(m)) == 0`, i.e. `n % 4 == 0`. The `n % 8 == 0` guard
+        // above already guarantees that for every cell that reaches here, so
+        // this can never actually fire -- an explicit assertion of the
+        // guarantee rather than a silent one, and it falls back to MLX's own
+        // `quantizedMM` (this function returning nil) rather than ever
+        // launching a truncated grid, should a future `routable()` relaxation
+        // ever violate it.
+        if Self.rowsPerSimd(m) == 2, n % 4 != 0 {
+            return nil
+        }
         // `ensureRowContiguous: true` would keep a strided input correct by
         // copying it first. `quantizedMM` reads the stride directly, so hand
         // the cell back rather than pay for a copy the incumbent avoids.
@@ -1831,7 +1880,7 @@ public enum Qwen35CustomQMV {
         return qwen35CustomAffine4QMVTableKernel(
             [w, scales, biases, x, xsums],
             template: [("USE_TABLE", consume)],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / (2 * Self.rowsPerSimd(cell.m))) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
@@ -1875,7 +1924,7 @@ public enum Qwen35CustomQMV {
         outShape[outShape.count - 1] = cell.n
         return qwen35CustomAffine4QMVKernel(
             [w, scales, biases, x],
-            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
+            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / (2 * Self.rowsPerSimd(cell.m))) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
