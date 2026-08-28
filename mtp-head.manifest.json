@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Pepedesigner/qwen38-mtp-head-v1@9c4d164010c37c07b254c052519b89c14472b75b",
+  "sha256": "5fa886773c8d90064b69b6bd8a4e2bf6f49e4303f3c17a6fb6f3a35d72631c5f",
+  "bytes": 427742180,
   "max_bytes": 2147483648,
-  "note": "xsums fill fusion on eb5eadc: the fused residual+RMSNorm kernel gains an emitSums variant whose epilogue is the BODY of qwen35_custom_affine4_g64_xsums_v1 verbatim, run over the normed bytes it has just stored (device barrier, same vec<bfloat16_t,4> loads, same three BF16 adds per group of four, same ascending float accumulation onto 0.0f, same (k_block*32+lane)*stride+row address), so the table is the standalone fill's bit pattern by construction. A weak-identity sidecar hands that table to Qwen35CustomQMV.matmul, deleting 127 of the 257 standalone xsums fill dispatches per verify round (mlp.gate_up 64, gdn.in_proj 47, fa.qkv 16); the other 130 keep xsumsTable unchanged. Only the sumtable arm at M=4...9 publishes, so M=1 (the serial leg) and prefill run the shipped kernel byte for byte. Widths 2...9, IPG table, tablePays>=4, 0.15, skip-probesort kept. Head tensors remain pinned. No remote code. resample-2 (54d42a3 diagnose: 6/7 active prompts faster, schedule identical, reprice 3.72612 > frontier 3.71960)"
+  "note": "Hybrid MTP head: trained v5 proposal block (q4-g64 quantized into the same container as the amal incumbent) plus the incumbent's draft_lm_head coarse-2bit shortlist readout and precision_islands carried byte-for-byte. v5 block fine-tuned by on-policy structural replay over an 18-domain ~25-window corpus. Local Swift acceptance 0.57-0.77 across hard-prose goldens vs 0.42-0.67 for the amal block; serial-relative speedup at 512-token window code 1.953 vs 1.667, math 1.262 vs 1.058, legal 1.596 vs 1.470. All_tokens_matched=true everywhere; head is proposal-only."
 }
