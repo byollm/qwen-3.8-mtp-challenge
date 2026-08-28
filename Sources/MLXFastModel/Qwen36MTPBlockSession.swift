@@ -191,9 +191,18 @@ public final class Qwen36MTPBlockSession {
         // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
-        draftPolicy = { [weak self] offeredDepth, _ in
+        draftPolicy = { [weak self] offeredDepth, round in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            // DCC-DS-RPAS: MTPDraftPolicy decides per-round depth from the
+            // cycle and the RoPE phase (the existing KV cache offset, the
+            // scalar form of `graphOffsetArray` / `RoPEApplication`). The
+            // cost-model schedule re-prices the chosen depth.
+            let phase = self.cache.first?.offset ?? 0
+            let policyDepth = self.draftPolicyStruct.decide(
+                offeredDepth: offeredDepth, round: round, phaseIndex: phase)
+            if policyDepth == 0 { return 0 }
+            return self.costModelDepth(offeredDepth: Swift.min(
+                policyDepth, offeredDepth))
         }
     }
 
@@ -707,6 +716,10 @@ public final class Qwen36MTPBlockSession {
         offeredDepth, _ in
         Swift.min(offeredDepth, 1)
     }
+
+    /// DCC-DS-RPAS schedule struct. Default is shipped (cycle [2,3,2,4]); a
+    /// `draft_policy` block in `mtp-head.manifest.json` overrides this.
+    public var draftPolicyStruct: MTPDraftPolicy = .shippedDefault
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
     /// telemetry counter; the cost-model schedule below reads the per-position

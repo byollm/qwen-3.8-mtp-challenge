@@ -633,3 +633,63 @@ public struct Qwen35FastEngine {
         )
     }
 }
+
+// MARK: - MTPDraftPolicy (DCC-DS-RPAS)
+//
+// Depth-Capped Cyclic Draft Schedule with RoPE-Phase-Aligned Skip. Mirrors
+// the policy keys in `mtp-head.manifest.json`. RoPE phase is the existing
+// KV cache offset (scalar form of what `graphOffsetArray(for:)` /
+// `RoPEApplication` expose). Cycle sum is hard-capped at 8 by the call-site
+// precondition.
+public struct MTPDraftPolicy: Equatable, Sendable {
+    public let staticDepthCycle: [Int]
+    public let phaseSkipThresholdRadians: Double
+    public let ropeBase: Float
+
+    public init(
+        staticDepthCycle: [Int] = [2, 3, 2, 4],
+        phaseSkipThresholdRadians: Double = .pi,
+        ropeBase: Float = 10_000_000
+    ) {
+        let cycle = staticDepthCycle.isEmpty ? [2] : staticDepthCycle
+        self.staticDepthCycle = cycle.map { Swift.max(0, Swift.min(8, $0)) }
+        self.phaseSkipThresholdRadians = phaseSkipThresholdRadians
+        self.ropeBase = ropeBase > 0 ? ropeBase : 10_000_000
+    }
+
+    public static let shippedDefault = MTPDraftPolicy()
+
+    public static func parse(manifestData: Data) -> MTPDraftPolicy {
+        guard let root = try? JSONSerialization.jsonObject(with: manifestData)
+            as? [String: Any], let policy = root["draft_policy"] as? [String: Any]
+        else { return .shippedDefault }
+        let cycle = (policy["static_depth_cycle"] as? [Int])
+            ?? (policy["staticDepthCycle"] as? [Int]) ?? []
+        let threshold = (policy["phase_skip_threshold_radians"] as? Double)
+            ?? (policy["phaseSkipThresholdRadians"] as? Double) ?? .pi
+        let base = (policy["rope_base"] as? Double).map(Float.init)
+            ?? (policy["ropeBase"] as? Double).map(Float.init) ?? 10_000_000
+        return MTPDraftPolicy(
+            staticDepthCycle: cycle,
+            phaseSkipThresholdRadians: threshold,
+            ropeBase: base
+        )
+    }
+
+    /// `phaseIndex` is the existing RoPE phase (KV cache offset). Returns the
+    /// per-round depth in `0 ... min(offered, 8)`. When `|phaseIndex/base|`
+    /// exceeds the threshold, the cycle entry is suppressed to 0.
+    public func decide(
+        offeredDepth: Int,
+        round: Int,
+        phaseIndex: Int
+    ) -> Int {
+        let cap = Swift.max(0, Swift.min(8, offeredDepth))
+        guard cap > 0, !staticDepthCycle.isEmpty else { return 0 }
+        let phaseRadians = Double(phaseIndex) / Double(ropeBase)
+        if phaseSkipThresholdRadians > 0,
+           abs(phaseRadians) > phaseSkipThresholdRadians { return 0 }
+        let depth = staticDepthCycle[round % staticDepthCycle.count]
+        return Swift.max(0, Swift.min(cap, depth))
+    }
+}
