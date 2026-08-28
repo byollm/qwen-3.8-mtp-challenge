@@ -59,6 +59,14 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?)
 
+    /// Adapter the static-shape verify compile-trace calls on every invocation.
+    /// The default implementation routes through `callWithHiddenAndNormed`
+    /// with the same `nConfirmed` value the session pinned; conformers that
+    /// can pre-bake a more specialised trace may override it.
+    func staticShapeVerifyForward(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -124,6 +132,19 @@ extension Qwen36MTPTarget {
         let (logits, hidden) = callWithHidden(
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
+    }
+
+    /// Default `staticShapeVerifyForward`: route through the existing
+    /// `callWithHiddenAndNormed` so the static-shape verify compile-trace
+    /// sees exactly the arithmetic the eager path dispatches, byte-for-byte.
+    /// The compile runtime's in-place cache mutation hooks into the same
+    /// captured graph every round, so the MTP draft loop's hot path is the
+    /// one MLX compile call.
+    public func staticShapeVerifyForward(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 }
 

@@ -241,4 +241,123 @@ public enum CompiledDecode {
         let cacheRef = cache.map { $0 as any KVCache }
         return compileForward(model: model, cacheRef: cacheRef)
     }
+
+    // MARK: - Static-shape verify compile (ZAC-SDL)
+
+    /// A compile-once, static-shape verify graph for the MTP draft loop.
+    ///
+    /// The hot path dispatches a single verified forward at a fixed maximum
+    /// width `1 + maxDepth` once per round. The graph is traced ONCE outside
+    /// the timed window, then reused for every round at every legal width
+    /// `<= 1 + maxDepth` -- unused trailing positions are filled with the
+    /// primary token so their logits are the same value under the verify
+    /// recurrence and their contributions are ignored on the accept walk.
+    ///
+    /// The intent is the Zero-Alloc Compiled Static-Shape MTP Draft Loop
+    /// (ZAC-SDL): pre-allocate the verify token buffer, the head-history
+    /// scratch and (when consumed) the logits column once per session, and
+    /// pay zero host graph build per step.
+    ///
+    /// The returned closure accepts a single `[1, maxWidth]` int32 token
+    /// array whose contents ARE the verify input; the buffer can be the
+    /// pre-allocated one if the caller wants a true zero-alloc hot path, in
+    /// which case they only need to fill the leading positions each round.
+    /// The closure returns `(logits, hidden, normed?)`, all as device arrays,
+    /// with `normed` published only when the model surface supports it
+    /// (mirroring the existing `callWithHiddenAndNormed` contract).
+    public typealias StaticShapeVerify = @Sendable (MLXArray) -> (
+        logits: MLXArray, hidden: MLXArray, normed: MLXArray?
+    )
+
+    /// Build a compile-once, static-shape verify forward closure. See
+    /// ``StaticShapeVerify`` for the input/output contract.
+    ///
+    /// The closure is for the MTP draft loop's verify forward (a multi-row
+    /// target call at `nConfirmed == 1`); the cache layout must therefore
+    /// match the target backbone's verify path. The session that owns the
+    /// call site is expected to maintain the cache and token buffer across
+    /// rounds so the compile-trace in-place mutation hooks into the same
+    /// captured graph every round.
+    ///
+    /// - Parameters:
+    ///   - cacheRef: Per-layer cache. Must be the same array across calls so
+    ///     MLX's compile-trace reuses the captured graph in place. Each
+    ///     element must implement ``Updatable``/`innerState()` (every cache
+    ///     type in the vendored library already does).
+    ///   - maxWidth: Static width the compile trace specialises on. The
+    ///     verify input is always `[1, maxWidth]`; shorter rounds fill the
+    ///     leading positions and let the trailing positions be processed
+    ///     for free (the verify forward is weight-stream bound, so the
+    ///     extra rows add QMV volume but not host graph build).
+    ///   - lmHeadForward: Adapter that calls the model's
+    ///     `callWithHiddenAndNormed`-equivalent and returns the
+    ///     `(logits, hidden, normed?)` triple. The triple becomes the
+    ///     static-shape verify's outer return value; the compile runtime
+    ///     itself sees a flat `[MLXArray]` where the third slot is empty
+    ///     when the adapter returned `normed == nil`.
+    ///   - tokenBuffer: Pre-allocated `[1, maxWidth]` int32 array, kept by
+    ///     the caller across rounds. The traced closure reads from it; the
+    ///     caller writes new token values into it each round.
+    /// - Returns: A `StaticShapeVerify` closure that reads the same
+    ///   `tokenBuffer` the caller provided at trace time.
+    public static func compileStaticShapeVerify(
+        cacheRef: [KVCache],
+        maxWidth: Int,
+        lmHeadForward: @escaping @Sendable (LMInput.Text) -> (
+            MLXArray, MLXArray, MLXArray?
+        ),
+        tokenBuffer: MLXArray
+    ) -> StaticShapeVerify {
+        precondition(maxWidth >= 1, "compileStaticShapeVerify: maxWidth must be >= 1")
+        precondition(
+            tokenBuffer.ndim == 2,
+            "compileStaticShapeVerify: tokenBuffer must be 2-D [1, W]")
+        precondition(
+            tokenBuffer.dim(0) == 1 && tokenBuffer.dim(1) == maxWidth,
+            "compileStaticShapeVerify: tokenBuffer shape [\(tokenBuffer.shape)] "
+                + "must be [1, \(maxWidth)]")
+        precondition(
+            tokenBuffer.dtype == .int32,
+            "compileStaticShapeVerify: tokenBuffer must be int32")
+        precondition(
+            !cacheRef.isEmpty,
+            "compileStaticShapeVerify: cacheRef must be non-empty")
+
+        let captured = cacheRef
+        let forward = lmHeadForward
+
+        // The trace function f is invoked by the compile runtime on the
+        // FIRST call only, with `inputs[0]` replaced by the caller-supplied
+        // token buffer and the cache's `innerState()` replaced by tracer
+        // arrays. Subsequent calls reuse the cached compiled graph; the
+        // inputs and outputs are updated in place by the runtime, so the
+        // cache the caller passed in keeps mutating through the same
+        // captured object.
+        //
+        // The compile runtime can only return a flat `[MLXArray]`, so the
+        // `normed == nil` case ships an empty slot. The outer wrapper
+        // below unwraps the flat array into the documented tuple.
+        let compiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+            inputs: [tokenBuffer] + captured,
+            outputs: captured
+        ) { (args: [MLXArray]) -> [MLXArray] in
+            // args[0] is the tracer view of `tokenBuffer`; the upstream
+            // call site fills the real buffer with [primary, draft_0, ...
+            // draft_{D-1}, primary, primary, ...] each round.
+            let (logits, hidden, normed) = forward(
+                LMInput.Text(tokens: args[0]))
+            if let normed { return [logits, hidden, normed] }
+            return [logits, hidden]
+        }
+
+        return { tokenBuffer in
+            let outs = compiled([tokenBuffer])
+            // outs is always [logits, hidden] or [logits, hidden, normed];
+            // the adapter above controls which.
+            if outs.count >= 3 {
+                return (outs[0], outs[1], outs[2])
+            }
+            return (outs[0], outs[1], nil)
+        }
+    }
 }
