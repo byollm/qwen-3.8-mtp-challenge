@@ -209,7 +209,7 @@ public enum Qwen35FullAttention {
         .reshaped(batchSize, sequenceLength, -1)
 
         return Qwen35Ops.linear(
-            attended * sigmoid(gate),
+            Qwen35Ops.sigmoidGate(attended, gate: gate),
             weights.outputProjection
         )
     }

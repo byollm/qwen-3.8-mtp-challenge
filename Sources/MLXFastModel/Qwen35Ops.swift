@@ -1,4 +1,5 @@
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// Architecture-neutral tensor primitives used by the custom Qwen35 path.
@@ -68,8 +69,23 @@ public enum Qwen35Ops {
         )
     }
 
+    private static let compiledPreciseGateAndMul:
+        @Sendable (MLXArray, MLXArray) -> MLXArray =
+    {
+        let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { gate, normalized in
+            (silu(gate.asType(.float32)) * normalized.asType(.float32))
+                .asType(normalized.dtype)
+        }
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            return compile(shapeless: true, body)
+        }
+        return body
+    }()
+
     /// Precise gated RMSNorm from pinned `Qwen3NextRMSNormGated`:
     /// normalize first, then compute SiLU(gate) and the product in float32.
+    /// Fuses the SiLU activation, float32 precision casts, elementwise product,
+    /// and output conversion into a single compiled Metal kernel launch.
     public static func preciseGatedRMSNorm(
         _ input: MLXArray,
         gate: MLXArray,
@@ -77,8 +93,47 @@ public enum Qwen35Ops {
         eps: Double
     ) -> MLXArray {
         let normalized = rmsNorm(input, weight: weight, eps: eps)
-        let preciseGate = silu(gate.asType(.float32))
-        return (preciseGate * normalized.asType(.float32))
-            .asType(input.dtype)
+        return compiledPreciseGateAndMul(gate, normalized)
+    }
+
+    private static let compiledSigmoidGate:
+        @Sendable (MLXArray, MLXArray) -> MLXArray =
+    {
+        let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { attended, gate in
+            attended * sigmoid(gate)
+        }
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            return compile(shapeless: true, body)
+        }
+        return body
+    }()
+
+    /// Fuses full-attention output gating `attended * sigmoid(gate)` into a single
+    /// compiled elementwise pass, avoiding intermediate allocation for sigmoid(gate).
+    public static func sigmoidGate(
+        _ attended: MLXArray,
+        gate: MLXArray
+    ) -> MLXArray {
+        compiledSigmoidGate(attended, gate)
+    }
+
+    private static let compiledSwiGLU:
+        @Sendable (MLXArray, MLXArray) -> MLXArray =
+    {
+        let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { gate, up in
+            silu(gate) * up
+        }
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            return compile(shapeless: true, body)
+        }
+        return body
+    }()
+
+    /// Fuses SwiGLU activation `silu(gate) * up` into a single compiled elementwise pass.
+    public static func swiglu(
+        _ gate: MLXArray,
+        _ up: MLXArray
+    ) -> MLXArray {
+        compiledSwiGLU(gate, up)
     }
 }

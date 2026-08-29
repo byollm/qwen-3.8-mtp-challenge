@@ -25,9 +25,12 @@ public enum Qwen35MLP {
         _ input: MLXArray,
         weights: Qwen35MLPWeights
     ) -> MLXArray {
-        let gate = silu(Qwen35Ops.linear(input, weights.gateProjection))
+        let gate = Qwen35Ops.linear(input, weights.gateProjection)
         let up = Qwen35Ops.linear(input, weights.upProjection)
-        return Qwen35Ops.linear(gate * up, weights.downProjection)
+        return Qwen35Ops.linear(
+            Qwen35Ops.swiglu(gate, up),
+            weights.downProjection
+        )
     }
 
     static func validateContract(
