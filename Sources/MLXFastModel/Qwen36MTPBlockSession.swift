@@ -1789,6 +1789,22 @@ public final class Qwen36MTPBlockSession {
     /// Preflight every layer before mutating any of them. Returning `false`
     /// leaves the cache untouched so the caller can use the generic snapshot
     /// and repair path safely.
+    ///
+    /// `restoreAfterPrefixReject`'s K == 1 rejected-draft branch (below,
+    /// `draftCount <= 1`) restores `arrays[0]`/`arrays[1]` from
+    /// `rollbackCheckpoints[acceptedCount]` the same way the K >= 2 branch
+    /// above restores from `replayRecurrentPrefix` — pure reassignment of
+    /// already-computed arrays, no new values, no new ops. The K >= 2 branch
+    /// already submits its restored arrays with `asyncEval` right after
+    /// (the "E020 replay-prefetch", promoted +0.039%) so the GPU starts on
+    /// them while the host builds the next round's forward graph instead of
+    /// both waiting on that graph's own blocking eval; the K == 1 branch
+    /// never got the same treatment. Same MLX-laziness argument, same call
+    /// shape, one branch lower in the same function.
+    /// `MLX_QWEN_K1_ROLLBACK_ASYNC_EVAL=0` restores the eager restore below
+    /// with no submission ahead of the caller's own eval, byte-for-byte.
+    private static let k1RollbackAsyncEvalEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_QWEN_K1_ROLLBACK_ASYNC_EVAL"] != "0"
     private static func restoreAfterPrefixReject(
         _ model: any Qwen36MTPTarget,
         _ cache: [any KVCache],
@@ -1843,6 +1859,7 @@ public final class Qwen36MTPBlockSession {
             }
         }
 
+        var k1Restored: [MLXArray] = []
         for entry in cache {
             if let arrays = entry as? ArraysCache {
                 let saved = arrays.rollbackCheckpoints[acceptedCount]
@@ -1851,9 +1868,16 @@ public final class Qwen36MTPBlockSession {
                 arrays.rollbackState = nil
                 arrays.rollbackCheckpoints = []
                 arrays.prefixReplayTape = nil
+                if k1RollbackAsyncEvalEnabled {
+                    k1Restored.append(saved.0)
+                    k1Restored.append(saved.1)
+                }
             } else if entry.isTrimmable {
                 _ = entry.trim(entry.offset - committedOffset)
             }
+        }
+        if !k1Restored.isEmpty {
+            asyncEval(k1Restored)
         }
         return true
     }
