@@ -60,19 +60,116 @@ enum MTPPinnedFiles {
         return directory
     }
 
-    /// The exact raw EigenLabs/Qwen3.8-27B-4bit@eda45ab snapshot. Nonweight
-    /// operator metadata is allowed; unknown safetensors shards are refused.
+    /// One pinned file directly inside the target snapshot directory.
+    struct TargetFile: Equatable, Sendable, Decodable {
+        let path: String
+        let sha256: String
+        let bytes: UInt64
+
+        init(path: String, sha256: String, bytes: UInt64) {
+            self.path = path
+            self.sha256 = sha256
+            self.bytes = bytes
+        }
+
+        /// Exact keys only: an unknown field may carry intent this verifier ignores.
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: AnyKey.self)
+            guard Set(container.allKeys.map(\.stringValue)) == ["path", "sha256", "bytes"] else {
+                throw MTPStartupError.invalid("Target manifest records must contain exactly path, sha256, and bytes.")
+            }
+            path = try container.decode(String.self, forKey: AnyKey("path"))
+            sha256 = try container.decode(String.self, forKey: AnyKey("sha256"))
+            bytes = try container.decode(UInt64.self, forKey: AnyKey("bytes"))
+        }
+
+        private struct AnyKey: CodingKey {
+            let stringValue: String
+            var intValue: Int? { nil }
+            init(_ stringValue: String) { self.stringValue = stringValue }
+            init?(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { nil }
+        }
+    }
+
+    /// The raw EigenLabs/Qwen3.8-27B-4bit@eda45ab snapshot used when no
+    /// --target-manifest is given.
+    static func compiledTarget() throws -> [TargetFile] {
+        try validatedTarget(targetManifest.split(separator: "\n").map { line in
+            let fields = line.split(separator: " ", omittingEmptySubsequences: false)
+            guard fields.count == 3, let bytes = UInt64(fields[1]) else {
+                throw MTPStartupError.invalid("Compiled target manifest record is malformed.")
+            }
+            return TargetFile(path: String(fields[2]), sha256: String(fields[0]), bytes: bytes)
+        })
+    }
+
+    static let targetManifestMaximumBytes = 1 << 20
+
+    /// The manifest is held to the same open, type, owner, and permission
+    /// rules as the files it pins. It must also be a single hard link so a
+    /// second name cannot swap the bytes this launch agreed to check.
+    static func targetManifest(path: String) throws -> [TargetFile] {
+        guard path.hasPrefix("/") else { throw MTPStartupError.invalid("--target-manifest must be absolute.") }
+        let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else { throw MTPStartupError.invalid("Cannot open target manifest regular file: \(path)") }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var state = stat()
+        guard fstat(descriptor, &state) == 0,
+            state.st_mode & S_IFMT == S_IFREG,
+            state.st_nlink == 1,
+            state.st_uid == geteuid() || state.st_uid == 0,
+            state.st_mode & 0o022 == 0,
+            state.st_size > 0, state.st_size <= targetManifestMaximumBytes
+        else { throw MTPStartupError.invalid("Target manifest type, owner, permissions, link count, or size is unsafe: \(path)") }
+        let data = try handle.read(upToCount: targetManifestMaximumBytes + 1) ?? Data()
+        guard data.count <= targetManifestMaximumBytes else {
+            throw MTPStartupError.invalid("Target manifest exceeds \(targetManifestMaximumBytes) bytes.")
+        }
+        let files: [TargetFile]
+        do { files = try JSONDecoder().decode([TargetFile].self, from: data) } catch {
+            throw MTPStartupError.invalid("Target manifest is not a JSON list of {path, sha256, bytes}: \(error.localizedDescription)")
+        }
+        return try validatedTarget(files)
+    }
+
+    /// Names are single plain components so every pin and the unpinned-shard
+    /// check address the same directory level.
+    static func validatedTarget(_ files: [TargetFile]) throws -> [TargetFile] {
+        let hex = Set("0123456789abcdef")
+        var names = Set<String>()
+        for file in files {
+            guard !file.path.isEmpty, !file.path.hasPrefix("."), !file.path.contains("/"),
+                file.path.utf8.count <= 255, !file.path.contains("\0"), names.insert(file.path).inserted
+            else { throw MTPStartupError.invalid("Target manifest path is invalid or duplicated: \(file.path)") }
+            guard file.sha256.count == 64, file.sha256.allSatisfy(hex.contains) else {
+                throw MTPStartupError.invalid("Target manifest SHA-256 must be 64 lowercase hex digits: \(file.path)")
+            }
+        }
+        guard files.contains(where: { $0.path.hasSuffix(".safetensors") }) else {
+            throw MTPStartupError.invalid("Target manifest pins no safetensors weights.")
+        }
+        return files
+    }
+
+    /// The exact raw EigenLabs/Qwen3.8-27B-4bit@eda45ab snapshot when `files`
+    /// is omitted. Nonweight operator metadata is allowed; unknown safetensors
+    /// shards are refused.
     static func verifyTarget(directory: URL) throws {
+        try verifyTarget(directory: directory, files: try compiledTarget())
+    }
+
+    /// Nonweight operator metadata is allowed; unknown safetensors shards are refused.
+    static func verifyTarget(directory: URL, files: [TargetFile]) throws {
         try verifyDirectory(directory)
-        let records = targetManifest.split(separator: "\n").map { $0.split(separator: " ") }
-        let names = Set(records.map { String($0[2]) })
+        let names = Set(files.map(\.path))
         let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         guard !entries.contains(where: { $0.hasSuffix(".safetensors") && !names.contains($0) }) else {
             throw MTPStartupError.invalid("The Qwen3.8 backbone contains an unpinned safetensors shard.")
         }
-        for record in records {
-            try verifyFile(directory.appendingPathComponent(String(record[2])),
-                           bytes: UInt64(record[1])!, sha256: String(record[0]))
+        for file in files {
+            try verifyFile(directory.appendingPathComponent(file.path), bytes: file.bytes, sha256: file.sha256)
         }
     }
 

@@ -14,7 +14,7 @@ public enum MTPServer {
         switch options.command {
         case .help:
             print(MLXServerCLI.help)
-            print("\nNative MTP: --engine-kind native_mtp --mtp-head <absolute path> --mtp-max-depth <1...8>\nRequires the pinned Qwen3.8 27B snapshot and greedy requests (temperature=0, no penalties).")
+            print("\nNative MTP: --engine-kind native_mtp --mtp-head <absolute path> --mtp-max-depth <1...8> [--target-manifest <absolute JSON file>]\nRequires the pinned Qwen3.8 27B snapshot, or the snapshot files listed in --target-manifest as [{path, sha256, bytes}], and greedy requests (temperature=0, no penalties).")
         case .listRoutes:
             let data = try JSONEncoder.openAIServer.encode(MLXServerRoute.manifest)
             print(String(decoding: data, as: UTF8.self))
@@ -33,7 +33,11 @@ public enum MTPServer {
                 throw MTPStartupError.invalid("native_mtp requires an absolute local pinned Qwen3.8 model directory.")
             }
             let target = URL(fileURLWithPath: configuration.model)
-            try MTPStartupStage.validateTarget.perform { try MTPPinnedFiles.verifyTarget(directory: target) }
+            try MTPStartupStage.validateTarget.perform {
+                let files = try options.targetManifestPath.map(MTPPinnedFiles.targetManifest(path:))
+                    ?? MTPPinnedFiles.compiledTarget()
+                try MTPPinnedFiles.verifyTarget(directory: target, files: files)
+            }
             let model = try load(target: target, head: head, maxDepth: options.maxDepth)
             let engine = MLXModelContainerEngine(modelID: configuration.model, model: model,
                 modelType: configuration.modelType, contextTokens: configuration.contextTokens,
