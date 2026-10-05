@@ -22,6 +22,17 @@ struct MTPStartupTests {
         #expect(configuration.reasoningParser == .qwen3)
     }
 
+    @Test("Native MTP accepts one absolute target manifest and leaves it out of the ordinary CLI")
+    func targetManifestOption() throws {
+        let args = ["server", "--model", "/models/qwen", "--engine-kind", "native_mtp",
+                    "--mtp-head", "/heads/mtp", "--target-manifest", "/manifests/target.json"]
+        let options = try MTPServerOptions.parse(arguments: args)
+        #expect(options.targetManifestPath == "/manifests/target.json")
+        let pinned = try MTPServerOptions.parse(arguments: Array(args.dropLast(2)))
+        #expect(pinned.targetManifestPath == nil)
+        #expect(options.command == pinned.command)
+    }
+
     @Test("Absent MTP arguments preserve the ordinary CLI result")
     func ordinaryOptionsUnchanged() throws {
         let args = ["server", "--model", "model", "--engine-kind", "single_request"]
@@ -29,6 +40,7 @@ struct MTPStartupTests {
         let ordinary = try MLXServerCLI.parse(arguments: args, environment: [:])
         #expect(options.command == ordinary)
         #expect(options.headPath == nil)
+        #expect(options.targetManifestPath == nil)
     }
 
     @Test("Serving loader uses the ranked allocator cap, including on a small machine")
@@ -129,13 +141,18 @@ struct MTPStartupTests {
         }
     }
 
-    @Test("Invalid depth, relative head, and incomplete fast mode fail closed",
+    @Test("Invalid depth, relative head, target manifest, and incomplete fast mode fail closed",
         arguments: [
             ["--engine-kind", "native_mtp"],
             ["--mtp-head", "/head"],
             ["--engine-kind", "native_mtp", "--mtp-head", "relative"],
             ["--engine-kind", "native_mtp", "--mtp-head", "/head", "--mtp-max-depth", "0"],
             ["--engine-kind", "native_mtp", "--mtp-head", "/head", "--mtp-max-depth", "9"],
+            ["--target-manifest", "/manifest.json"],
+            ["--engine-kind", "single_request", "--target-manifest", "/manifest.json"],
+            ["--engine-kind", "native_mtp", "--mtp-head", "/head", "--target-manifest", "manifest.json"],
+            ["--engine-kind", "native_mtp", "--mtp-head", "/head", "--target-manifest"],
+            ["--engine-kind", "native_mtp", "--mtp-head", "/head", "--target-manifest", "/a.json", "--target-manifest", "/b.json"],
         ])
     func invalidOptions(args: [String]) {
         #expect(throws: (any Error).self) { try MTPServerOptions.parse(arguments: ["server"] + args) }
