@@ -51,7 +51,7 @@ final class MTPRequestStatisticsStore: @unchecked Sendable {
     var snapshot: MTPServingStatistics? { lock.withLock { value } }
 }
 
-final class ObservedMTPServingSession: MTPServingSession {
+final class ObservedMTPServingSession: MTPServingSession, MTPPrefixReusableSession {
     private let session: any MTPServingSession
     private let store: MTPRequestStatisticsStore
     init(session: any MTPServingSession, store: MTPRequestStatisticsStore) {
@@ -66,5 +66,19 @@ final class ObservedMTPServingSession: MTPServingSession {
         defer { store.record(session.statistics) }
         return try session.round(depth: depth)
     }
+    /// Forward the prefix reuse to the wrapped session when it supports it.
+    ///
+    /// The wrapper always advertises the capability, so the caller does not
+    /// have to know which session it holds; a session that cannot be reused
+    /// simply starts from scratch.
+    func beginForServingReusingPrefix(seedTokens: [Int]) throws {
+        defer { store.record(session.statistics) }
+        if let reusable = session as? any MTPPrefixReusableSession {
+            try reusable.beginForServingReusingPrefix(seedTokens: seedTokens)
+            return
+        }
+        try session.begin(seedTokens: seedTokens)
+    }
+    var servedTokens: [Int] { (session as? any MTPPrefixReusableSession)?.servedTokens ?? [] }
     var statistics: MTPServingStatistics? { session.statistics }
 }

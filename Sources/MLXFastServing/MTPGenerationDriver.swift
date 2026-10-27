@@ -10,6 +10,14 @@ public struct MTPGenerationDriver: MLXServerGenerationDriver {
     private let makeSession: SessionFactory
     private let diagnostics: @Sendable (MTPRequestDiagnostic) -> Void
     private let gate = MTPAdmission()
+    /// Holds the session that outlives one HTTP request.
+    ///
+    /// The native MTP session owns the model's cache, and that cache IS the
+    /// prefix cache: keeping the session alive across requests is what lets
+    /// the next request continue the previous request's prompt instead of
+    /// re-prefilling it. Requests are serialized by the admission gate, so one
+    /// slot is enough.
+    private let sessionStore = MTPSessionStore()
 
     public init(maxDepth: Int = 8,
                 diagnostics: @escaping @Sendable (MTPRequestDiagnostic) -> Void = MTPRequestDiagnostic.writeStandardError,
@@ -42,6 +50,7 @@ public struct MTPGenerationDriver: MLXServerGenerationDriver {
         let started = DispatchTime.now().uptimeNanoseconds
         let requestID = UUID().uuidString
         let statistics = MTPRequestStatisticsStore()
+        let sessionBox = MTPSessionBox()
         @Sendable func report(_ outcome: MTPRequestDiagnostic.Outcome, completionTokens: Int?) {
             diagnostics(.init(requestID: requestID, outcome: outcome, maxDepth: maxDepth,
                 statistics: statistics.snapshot, completionTokens: completionTokens,
@@ -61,8 +70,17 @@ public struct MTPGenerationDriver: MLXServerGenerationDriver {
                     if let id = context.tokenizer.convertTokenToId(token) { stops.insert(id) }
                 }
                 if let unknown = context.tokenizer.unknownTokenId { stops.insert(unknown) }
-                let session = ObservedMTPServingSession(session: try makeSession(context, stops),
-                                                        store: statistics)
+                // The session owns the model's cache. Reusing it is what turns
+                // the next request into a tail-only prefill; a session that
+                // cannot be reused is simply replaced.
+                let base: any MTPServingSession
+                if let reusable = sessionStore.take() as? any MTPPrefixReusableSession {
+                    base = reusable
+                } else {
+                    base = try makeSession(context, stops)
+                }
+                let session = ObservedMTPServingSession(session: base, store: statistics)
+                sessionBox.session = session
                 let failure = MTPGenerationFailure()
                 let iterator = MTPTokenIterator(session: session,
                     seedTokens: input.text.tokens.asArray(Int.self),
@@ -97,6 +115,11 @@ public struct MTPGenerationDriver: MLXServerGenerationDriver {
                 if let error = handle.failure.error { throw error }
                 try Task.checkCancellation()
                 report(.completed, completionTokens: completionTokens)
+                // The request completed, so the cache matches the tokens it
+                // committed and the next request may continue it. A failed or
+                // cancelled request leaves the cache in an unknown state, so
+                // that session is dropped instead of reused.
+                sessionStore.put(sessionBox.session)
                 await gate.release()
                 continuation.finish()
             } catch {
@@ -122,15 +145,48 @@ public enum MTPServingError: Error, CustomStringConvertible {
     public var description: String { "native_mtp requires the pinned MTP-capable Qwen3.8 27B model." }
 }
 
-private final class WinningMTPServingSession: MTPServingSession {
+private final class WinningMTPServingSession: MTPServingSession, MTPPrefixReusableSession {
     private let session: Qwen36MTPBlockSession
     init(session: Qwen36MTPBlockSession) { self.session = session }
     func begin(seedTokens: [Int]) throws { try session.beginForServing(seedTokens: seedTokens) }
     func round(depth: Int) throws -> [Int] { try session.generateRound(depth: depth).tokens }
+    /// Continue the previous request's cache when the prompt extends it.
+    func beginForServingReusingPrefix(seedTokens: [Int]) throws {
+        try session.beginForServingReusingPrefix(seedTokens: seedTokens)
+    }
+    var servedTokens: [Int] { session.servedTokens }
     var statistics: MTPServingStatistics? {
         .init(cycles: session.roundCount, acceptedDrafts: session.acceptedDraftTotal,
               rejectedDrafts: session.rejectedDraftTotal, committedTokens: session.committedTokenCount)
     }
+}
+
+/// One-slot holder for the session that outlives a request.
+///
+/// The lock is the whole concurrency story: the admission gate serializes
+/// requests, so the slot is only ever taken and filled by one request at a
+/// time, and the lock keeps that true if that ever changes.
+private final class MTPSessionStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: (any MTPServingSession)?
+
+    func take() -> (any MTPServingSession)? {
+        lock.withLock {
+            let taken = session
+            session = nil
+            return taken
+        }
+    }
+
+    func put(_ newSession: (any MTPServingSession)?) {
+        lock.withLock { session = newSession }
+    }
+}
+
+/// Carries the session out of the model's perform closure so the driver can
+/// hand it back to the store once the request completes.
+private final class MTPSessionBox: @unchecked Sendable {
+    var session: (any MTPServingSession)?
 }
 
 private struct MTPStreamHandle: Sendable {
