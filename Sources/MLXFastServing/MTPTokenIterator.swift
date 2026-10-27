@@ -12,6 +12,20 @@ public extension MTPServingSession {
     var statistics: MTPServingStatistics? { nil }
 }
 
+/// A session whose cache can be continued by a prompt that EXTENDS the token
+/// sequence the cache already represents.
+///
+/// The capability is SEPARATE from `MTPServingSession` on purpose: a session
+/// that cannot be reused still serves requests, and a caller must not assume
+/// that any session's cache survives its request.
+public protocol MTPPrefixReusableSession: MTPServingSession {
+    /// Tokens the session's cache currently represents.
+    var servedTokens: [Int] { get }
+    /// Begin a request, reusing the previous request's cache when the prompt
+    /// extends the cached sequence.
+    func beginForServingReusingPrefix(seedTokens: [Int]) throws
+}
+
 public final class MTPGenerationFailure: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: (any Error)?
@@ -46,7 +60,11 @@ public struct MTPTokenIterator: TokenIteratorProtocol {
         do {
             try Task.checkCancellation()
             if !began {
-                try session.begin(seedTokens: seedTokens)
+                if let reusable = session as? any MTPPrefixReusableSession {
+                    try reusable.beginForServingReusingPrefix(seedTokens: seedTokens)
+                } else {
+                    try session.begin(seedTokens: seedTokens)
+                }
                 // Prefill happens inside next(), so the common loop already
                 // includes it in promptTime. Adding it here would double count.
                 began = true

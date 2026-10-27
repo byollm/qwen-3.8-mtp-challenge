@@ -76,6 +76,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case alreadyBegun
     case invalidDepth(Int)
     case emptySeed
+    case prefixDiverged
 
     public var description: String {
         switch self {
@@ -92,6 +93,9 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
             return "MTP draft depth \(depth) is out of range"
         case .emptySeed:
             return "MTP seed prefill requires a non-empty seed"
+        case .prefixDiverged:
+            return "the prompt does not extend the cached prefix, and the "
+                + "recurrent state cannot be rewound"
         }
     }
 }
@@ -160,6 +164,21 @@ public final class Qwen36MTPBlockSession {
     public private(set) var rejectedDraftTotal = 0
     public private(set) var rollbackRoundCount = 0
     public private(set) var began = false
+
+    /// Prefix bookkeeping for the cross-request cache: the token sequence the
+    /// cache represents, and the policy that decides whether a new prompt can
+    /// continue it.
+    private var prefixCache = Qwen36MTPPrefixCache()
+
+    /// Tokens the cache currently represents: the seed plus every committed
+    /// token.
+    ///
+    /// This is the contract that makes a cross-request prefix cache safe. The
+    /// cached recurrent state and the cached attention KV are only meaningful
+    /// for the exact sequence they were built from, so a prompt that does not
+    /// EXTEND this sequence cannot reuse the cache — the recurrent state
+    /// cannot be rewound.
+    public var servedTokens: [Int] { prefixCache.tokens }
 
     public init(
         model: any Qwen36MTPTarget,
@@ -682,12 +701,23 @@ public final class Qwen36MTPBlockSession {
             throw MLXFastError.invalidInput("Serving prefill chunk size must be 1...512.")
         }
         cache = model.newCache(parameters: nil)
+        prefixCache.reset()
+        prefixCache.record(seedTokens)
+        return try prefillIntoCache(tokens: seedTokens, chunkSize: chunkSize)
+    }
+
+    /// Prefill `tokens` into the CURRENT cache, in chunks.
+    ///
+    /// The cache is NOT created here: the caller owns its lifetime, and that
+    /// is exactly what lets a continued request reuse the state a previous
+    /// request left behind.
+    private func prefillIntoCache(tokens: [Int], chunkSize: Int) throws -> MLXArray {
         var chunks: [MLXArray] = []
-        for start in stride(from: 0, to: seedTokens.count, by: chunkSize) {
+        for start in stride(from: 0, to: tokens.count, by: chunkSize) {
             try Task.checkCancellation()
-            let tokens = Array(seedTokens[start..<Swift.min(start + chunkSize, seedTokens.count)])
+            let slice = Array(tokens[start..<Swift.min(start + chunkSize, tokens.count)])
             let (_, hidden) = model.callWithHidden(input: .init(
-                tokens: MLXArray(tokens).reshaped([1, tokens.count])),
+                tokens: MLXArray(slice).reshaped([1, slice.count])),
                 cache: cache, nConfirmed: 0)
             // Retain materialized pre-norm rows for exact committed-history
             // alignment; never evaluate the dead full-vocabulary projection.
@@ -724,6 +754,107 @@ public final class Qwen36MTPBlockSession {
         began = true
         return pendingPrimary!
     }
+
+    /// Begin a request, reusing the previous request's cache when the prompt
+    /// EXTENDS the token sequence that cache represents.
+    ///
+    /// This is the cross-request prefix cache. The tokens the cache does not
+    /// already hold are prefilled into the SAME cache — the GatedDeltaNet
+    /// state and the attention KV of the reused prefix are kept — so only the
+    /// tail is computed. A prompt that does not extend the cached sequence
+    /// cannot reuse it: the recurrent state cannot be rewound, so the cache is
+    /// dropped and the prompt is prefilled from scratch.
+    ///
+    /// The first primary stays pending, exactly like `beginForServing`: only
+    /// `generateRound` commits and emits it.
+    @discardableResult
+    public func beginForServingReusingPrefix(seedTokens: [Int]) throws -> Int {
+        try Task.checkCancellation()
+        guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
+        guard prefixCache.canContinue(with: seedTokens) else {
+            // Divergence, or the first request on this session: a fresh cache
+            // and a full prefill.
+            resetRequestState()
+            return try beginForServing(seedTokens: seedTokens)
+        }
+        let reused = prefixCache.tokenCount
+        let tail = Array(seedTokens[reused...])
+        // The head's committed history is still valid for the reused prefix,
+        // so it survives the reset; the tail's rows are appended to it below.
+        resetRequestState(keepingHeadHistory: true)
+        let hidden = try prefillIntoCache(tokens: tail, chunkSize: Self.servingPrefillChunkSize)
+        pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
+        let (tailIDs, tailValues) = Self.linearTopTwoRows(model.applyLMHead(pendingHidden!))
+        eval(cache.flatMap { $0.state } + [tailIDs, tailValues, pendingHidden!, hidden])
+        let readTail = (
+            tailIDs.asArray(Int32.self).map(Int.init),
+            tailValues.asArray(Float.self).map(Double.init)
+        )
+        pendingPrimary = readTail.0[0]
+        pendingTop2 = readTail
+        seedTokenCount = seedTokens.count
+        committedTokenCount = 0
+        prefixCache.reset()
+        prefixCache.record(seedTokens)
+        if headHistoryCache == nil {
+            // A fresh head cache has no history at all: prime it with the tail
+            // so the head still drafts from the new prompt.
+            seedHiddenForPriming = hidden
+            seedTokensForPriming = tail
+        }
+        appendHeadHistoryTail(hidden: hidden, tokens: tail)
+        began = true
+        try Task.checkCancellation()
+        return pendingPrimary!
+    }
+
+    /// Clear the per-request state so this session can serve another request.
+    ///
+    /// The CACHE is deliberately kept: only the caller knows whether the
+    /// recurrent state can be continued, and replacing it is the caller's
+    /// decision.
+    private func resetRequestState(keepingHeadHistory: Bool = false) {
+        pendingPrimary = nil
+        pendingTop2 = nil
+        pendingHidden = nil
+        seedHiddenForPriming = nil
+        seedTokensForPriming = []
+        if !keepingHeadHistory {
+            headHistoryCache = nil
+            headHistoryBacklogHidden.removeAll(keepingCapacity: true)
+            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+        }
+        seedTokenCount = 0
+        committedTokenCount = 0
+        roundCount = 0
+        acceptedDraftTotal = 0
+        rejectedDraftTotal = 0
+        rollbackRoundCount = 0
+        fullAcceptStreak = 0
+        began = false
+    }
+
+    /// Append the continued prompt's rows to the head's committed history.
+    ///
+    /// The head's cache already holds the rows for the reused prefix, so the
+    /// tail's rows go through the same backlog the committed-token flush uses.
+    /// The layout is the priming layout: the hidden at position `t` pairs with
+    /// the token at `t + 1`.
+    ///
+    /// ONE ROW IS MISSING at the boundary: the row that pairs the last reused
+    /// position with the first tail token. The head only PROPOSES, so a
+    /// shorter history changes the accept rate, never an emitted token.
+    private func appendHeadHistoryTail(hidden: MLXArray, tokens: [Int]) {
+        guard tokens.count >= 2 else { return }
+        let primeCount = tokens.count - 1
+        headHistoryBacklogHidden.append(
+            model.applyFinalNorm(hidden[0..., 0 ..< primeCount, 0...]))
+        headHistoryBacklogTokens.append(contentsOf: tokens[1...])
+    }
+
+    /// Chunk size the serving prefill uses. The prefill is chunked so a long
+    /// prompt does not build one huge graph.
+    public static let servingPrefillChunkSize = 512
 
     // MARK: - draft schedule (EDITABLE POLICY)
 
@@ -1392,6 +1523,7 @@ public final class Qwen36MTPBlockSession {
             Self.traceRow(
                 pos: seedTokenCount + committedTokenCount,
                 ids: tailTokens, values: tailLogits)
+            prefixCache.record(committed)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -1761,6 +1893,7 @@ public final class Qwen36MTPBlockSession {
         // them. The rare generic-repair path ran its own second eval.
         // `pendingHidden` is likewise device-only until the next round.
 
+        prefixCache.record(committed)
         return Qwen36MTPRoundResult(
             tokens: committed,
             declaredRows: draftCount + 1,
